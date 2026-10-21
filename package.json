@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "dsh-memory-inject",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "Inject USER.md / MEMORY.md as fixed curated memory into DeepSeek Harness sessions — the 'always-on' half of a memory system, without any LLM call.",
   "type": "module",
   "main": "index.js",
@@ -12,6 +12,7 @@
   },
   "files": [
     "index.js",
+    "selfcheck.mjs",
     "client.js",
     "lib/",
     "scripts/",
@@ -34,7 +35,8 @@
     "node": ">=22.15.0"
   },
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "selfcheck": "node selfcheck.mjs"
   },
   "dsh": {
     "bundle": {

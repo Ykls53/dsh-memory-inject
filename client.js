@@ -18,6 +18,25 @@ window.__ModuleLoader__.load({
 
     const API = '/api/memory-inject'
 
+    /**
+     * 这个面板需要后端提供的能力。
+     * 后端插件是在 DSH 进程启动时加载的，改了文件不重载；而前端每次开设置都重新拉。
+     * 于是会出现「面板有新按钮、后端是旧代码」——只报 unknown POST /capture 根本看不懂。
+     * 拿 /state 的 routes 一比，缺什么当场说清楚。
+     */
+    const NEEDED_ROUTES = [
+      'capture',
+      'backups',
+      'restore',
+      'session',
+      'similar',
+      'export',
+      'import',
+      'reindex',
+      'sessions',
+      'search',
+    ]
+
     const card = { border: '1px solid rgba(128,128,128,.25)', borderRadius: 10, padding: 14, marginBottom: 16 }
     const btn = {
       padding: '5px 12px',
@@ -461,14 +480,44 @@ window.__ModuleLoader__.load({
 
       if (!data) return h('div', { style: { padding: 16, fontSize: 13 } }, msg || '读取中…')
 
+      // 前后端错配检测：后端没声明的能力，直接点名让用户重启
+      const backendRoutes = Array.isArray(data.routes) ? data.routes : []
+      const missing = NEEDED_ROUTES.filter((r) => !backendRoutes.includes(r))
+      const staleBanner =
+        missing.length > 0
+          ? h(
+              'div',
+              {
+                style: {
+                  ...card,
+                  borderColor: 'rgba(220,140,20,.55)',
+                  background: 'rgba(220,140,20,.08)',
+                  padding: 12,
+                  marginBottom: 12,
+                },
+              },
+              h('strong', null, '后端插件是旧版本，先重启客户端'),
+              h('div', { style: { ...muted, marginTop: 4 } },
+                '面板已经是最新的，但服务端仍停在 DSH 启动时加载的那份代码。' +
+                '下面这些功能现在点了会 404：'),
+              h('div', { style: { ...muted, marginTop: 2, fontFamily: 'monospace' } }, missing.join('　')),
+              h('div', { style: { ...muted, marginTop: 4 } },
+                '关掉 DeepSeek Harness 重新打开即可（不必清缓存）。'),
+            )
+          : null
+
       return h(
         'div',
         { style: { padding: '4px 2px', fontSize: 13 } },
 
+        staleBanner,
+
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
           tabBtn('memory', '常驻记忆'),
           tabBtn('sessions', '会话摘要'),
-          h('span', { style: { ...muted, marginLeft: 'auto' } }, tab === 'memory' ? '第 1 层' : '第 2 / 3 层'),
+          h('span', { style: { ...muted, marginLeft: 'auto' } },
+            tab === 'memory' ? '第 1 层' : '第 2 / 3 层'),
+          h('span', { style: muted }, data.version ? `v${data.version}` : ''),
         ),
 
         tab === 'memory'

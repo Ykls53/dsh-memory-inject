@@ -46,6 +46,16 @@ try {
 }
 
 const PLUGIN_NAME = 'dsh-memory-inject'
+
+/** 插件版本：从自己的 package.json 读，面板拿它判断「后端是不是旧代码」。 */
+const PLUGIN_VERSION = (() => {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url))
+    return JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf-8')).version || '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+})()
 const SOURCE_KIND = `plugin:${PLUGIN_NAME}`
 
 /** 需要的 DSH 服务；只声明真正用到的，缺了会被框架拦在 apply 之前。 */
@@ -769,9 +779,32 @@ function readJsonBody(req) {
   })
 }
 
+/**
+ * 本插件对外暴露的全部路由名。
+ * 用途：面板拿它跟自己的期望比对 —— 前端是新拉的、后端却是进程启动时的旧代码，
+ * 这种错配只靠报错（unknown POST /capture）根本看不懂，所以要显式声明能力。
+ */
+const ROUTES = [
+  'state',
+  'write',
+  'config',
+  'capture',
+  'backups',
+  'restore',
+  'session',
+  'similar',
+  'export',
+  'import',
+  'reindex',
+  'sessions',
+  'search',
+]
+
 function statePayload(cfg) {
   return {
     ok: true,
+    version: PLUGIN_VERSION,
+    routes: ROUTES,
     autoCapture: cfg.autoCapture !== false,
     memoryDir: cfg.memoryDir,
     modelNote: '自动回填用的是 DSH 当前模型（settings.yaml 的 agent-default-model），你在模型选择器里换它跟着换',

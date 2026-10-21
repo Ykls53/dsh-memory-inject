@@ -133,6 +133,12 @@ test('GET /state：返回两份文件和生效上限', async () => {
     assert.strictEqual(r.body.files[0].name, 'USER.md')
     assert.ok(r.body.files[0].maxChars > 0)
     assert.strictEqual(r.body.autoCapture, false, '默认应当是关的')
+    // 版本 + 能力声明：面板靠这两个字段判断「后端是不是旧代码」
+    assert.ok(r.body.version, '/state 必须返回插件版本')
+    assert.ok(Array.isArray(r.body.routes), '/state 必须返回路由清单')
+    for (const need of ['capture', 'backups', 'restore', 'reindex', 'export', 'import']) {
+      assert.ok(r.body.routes.includes(need), `routes 里缺 ${need}`)
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
