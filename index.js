@@ -28,6 +28,7 @@ import {
   readdirSync,
   statSync,
   copyFileSync,
+  unlinkSync,
 } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -746,22 +747,42 @@ ${body}
 
 输出：`
 
-/** 跑一次 headless agent 做提炼；失败一律返回 null，不抛。 */
+/**
+ * 跑一次 headless agent 做提炼；失败一律返回 null，不抛。
+ *
+ * ⚠️ prompt **必须走 stdin，不能塞进 argv**（2026-10-21 实测踩到的坑）：
+ *    Windows 上 dsh 是 .cmd 壳，spawn 它必须 `shell: true`，而 shell 走 cmd.exe ——
+ *    **cmd.exe 把换行当成命令分隔符**。多行 prompt 塞进 argv 的结果是：
+ *    只有第一行成了位置参数，格式要求和对话正文全部丢失。
+ *
+ *    现象：面板点「现在提炼」永远「USER 0 条 / ENV 0 条」，
+ *    而模型回的是「这轮没有可提炼的内容」—— 它压根没收到对话。实测只传进去 42 个字符。
+ *
+ *    自己拼 exe + cli.js 绕开 shell 也试过：直接 spawn 那个 exe 完全没输出，
+ *    不通。正解就是喂 stdin —— 内容不进命令行，换行怎么都安全。
+ *    实测：多行 prompt 经 stdin 送达后，模型能准确答出「3 行；关键词是蓝色鲸鱼」。
+ */
 function runHeadlessExtract(prompt, cfg) {
   return new Promise((resolve) => {
     const cmd = process.env.DSH_CLI || 'dsh'
     let out = ''
     let child
     try {
-      child = spawn(cmd, ['--profile', 'headless', prompt], {
+      child = spawn(cmd, ['--profile', 'headless'], {
         cwd: cfg.memoryDir,
         env: { ...process.env, [AUTO_ENV]: '1' },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         shell: process.platform === 'win32', // dsh 在 Windows 上是 .cmd
         windowsHide: true,
       })
     } catch {
       return resolve(null)
+    }
+    // 写完立刻 end()，让 headless 知道输入结束
+    try {
+      child.stdin.end(prompt, 'utf8')
+    } catch {
+      /* 写不进去就等超时把它收掉 */
     }
     const timer = setTimeout(() => {
       try {
@@ -848,20 +869,34 @@ function applyAutoCapture(ctx, cfg) {
     if (event?.type !== 'turn/end') return
     lastTurnRef = { session, event } // 不管开关，都留着备用
     if (!cfg.autoCapture) return
-    if (running) return // 上一轮的提炼还没完，跳过这一轮，不排队堆积
+    if (running) {
+      _probe('自动回填：上一轮还在提炼，跳过这一轮')
+      return
+    }
 
     const body = renderTurnForCapture(session, event)
-    if (!body) return
+    if (!body) {
+      _probe('自动回填：这一轮抽不出正文，跳过')
+      return
+    }
 
     running = true
+    _probe(`自动回填：开始提炼（正文 ${body.length} 字符）`)
     runHeadlessExtract(EXTRACT_PROMPT(body), cfg)
       .then((text) => {
-        if (!text) return
+        if (!text) {
+          _probe('自动回填：提炼没返回（headless 起不来或模型没回话）')
+          return
+        }
         const parsed = parseExtract(text)
+        _probe(`自动回填：解析出 USER ${parsed.user.length} 条 / ENV ${parsed.env.length} 条｜raw=${JSON.stringify(String(text).slice(0, 300))}`)
         if (parsed.user.length === 0 && parsed.env.length === 0) return
         persistExtract(ctx, cfg, parsed)
       })
-      .catch((e) => ctx.logger?.warn?.(`[${PLUGIN_NAME}] 自动回填失败：${e.message}`))
+      .catch((e) => {
+        _probe(`自动回填失败：${e?.message || e}`)
+        ctx.logger?.warn?.(`[${PLUGIN_NAME}] 自动回填失败：${e.message}`)
+      })
       .finally(() => {
         running = false
       })
