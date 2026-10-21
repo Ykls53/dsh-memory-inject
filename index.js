@@ -20,11 +20,20 @@
  * 没有依赖：只用 node 内置模块，读不到文件就静默跳过（插件永不拖垮会话）。
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs'
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  copyFileSync,
+} from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 import { readStore, writeStore, patchStore, batchStore, DELIM } from './lib/store.mjs'
 
@@ -661,12 +670,16 @@ function persistExtract(ctx, cfg, { user, env }) {
   }
 }
 
+/** 最近一轮的引用：自动回填关着的时候，面板里的「现在提炼」也用它。 */
+let lastTurnRef = null
+
 function applyAutoCapture(ctx, cfg) {
-  if (!cfg.autoCapture) return
   let running = false
 
   ctx.on('session/event', (session, event) => {
     if (event?.type !== 'turn/end') return
+    lastTurnRef = { session, event } // 不管开关，都留着备用
+    if (!cfg.autoCapture) return
     if (running) return // 上一轮的提炼还没完，跳过这一轮，不排队堆积
 
     const body = renderTurnForCapture(session, event)
@@ -777,7 +790,244 @@ function statePayload(cfg) {
   }
 }
 
-/** 中期记忆（第 2 层）目录视图：最近会话 + 摘要。 */
+// ── 面板用的辅助能力：回滚 / 下钻 / 相似检测 / 导入导出 / 重建索引 ──
+
+/** 某份文件的备份清单（新的在前）。 */
+function listBackups(dir, file) {
+  const bdir = path.join(dir, '.backup')
+  if (!existsSync(bdir)) return []
+  try {
+    return readdirSync(bdir)
+      .filter((f) => f.startsWith(file + '.bak-'))
+      .map((f) => {
+        const st = statSync(path.join(bdir, f))
+        const stampRaw = f.slice((file + '.bak-').length).replace(/-/g, '')
+        const y = stampRaw.slice(0, 4)
+        const mo = stampRaw.slice(4, 6)
+        const d = stampRaw.slice(6, 8)
+        const hh = stampRaw.slice(9, 11)
+        const mm = stampRaw.slice(11, 13)
+        const ss = stampRaw.slice(13, 15)
+        return {
+          name: f,
+          time: st.mtimeMs,
+          size: st.size,
+          label: `${y}-${mo}-${d} ${hh}:${mm}:${ss}`,
+        }
+      })
+      .sort((a, b) => b.time - a.time)
+  } catch {
+    return []
+  }
+}
+
+/** 从备份恢复一份文件。只接受本目录里、同前缀的备份名（防路径穿越）。 */
+function restoreBackup(dir, file, name) {
+  if (typeof name !== 'string' || !name.startsWith(file + '.bak-')) {
+    return { ok: false, error: '备份名不合法（必须属于这个文件）' }
+  }
+  if (name.includes('..') || name.includes('/') || name.includes('\\')) {
+    return { ok: false, error: '备份名里不能有路径分隔符' }
+  }
+  const src = path.join(dir, '.backup', name)
+  if (!existsSync(src)) return { ok: false, error: '这个备份不存在了' }
+  try {
+    // 恢复前先把当前内容也备份一份，免得恢复错了回不去
+    const cur = path.join(dir, file)
+    if (existsSync(cur)) {
+      const bdir = path.join(dir, '.backup')
+      mkdirSync(bdir, { recursive: true })
+      const now = new Date()
+      const p = (n) => String(n).padStart(2, '0')
+      copyFileSync(
+        cur,
+        path.join(
+          bdir,
+          `${file}.bak-${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`,
+        ),
+      )
+    }
+    copyFileSync(src, cur)
+    const after = readStore(dir, file)
+    return { ok: true, restored: name, entries: after.entries.length, chars: after.entries.join(DELIM).length }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  }
+}
+
+/** 某个会话的完整对话（第 3 层下钻）。 */
+function sessionDetail(cfg, id) {
+  if (!id) return { ok: false, error: '缺 session id' }
+  const { db, error } = openIndex(cfg.memoryDir)
+  if (error) return { ok: false, error }
+  try {
+    const meta =
+      db.prepare('select title, created_at, project, msg_count from sessions where id = ?').get(id) || {}
+    let summary = null
+    try {
+      summary = db.prepare('select summary from session_summaries where session_id = ?').get(id)?.summary || null
+    } catch {
+      /* 没摘要表 */
+    }
+    const rows = db
+      .prepare(
+        `select role, ts, text from chunks
+         where session_id = ? and kind = 'msg'
+         order by coalesce(ts, 0), id limit 400`,
+      )
+      .all(id)
+    return {
+      ok: true,
+      id,
+      title: meta.title || '(无标题)',
+      project: meta.project || '',
+      created: fmtTime(meta.created_at),
+      msgs: meta.msg_count || rows.length,
+      summary,
+      messages: rows.map((r) => ({ role: r.role, time: fmtTime(r.ts), text: r.text })),
+    }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  } finally {
+    db.close?.()
+  }
+}
+
+/**
+ * 相似条目检测：加一条之前先看看有没有「换个说法但意思一样」的。
+ * 用双字组重合度（中文没有空格分词，双字组够用且快），不引入任何依赖。
+ */
+function findSimilar(dir, file, text) {
+  const target = String(text || '').trim()
+  if (target.length < 4) return []
+  const norm = (s) =>
+    String(s)
+      .replace(/\s+/g, '')
+      .replace(/[，。、；：""''（）()《》【】!?！？,.;:]/g, '')
+  const bigrams = (s) => {
+    const set = new Set()
+    for (let i = 0; i < s.length - 1; i += 1) set.add(s.slice(i, i + 2))
+    return set
+  }
+  const a = bigrams(norm(target))
+  if (a.size === 0) return []
+  const out = []
+  for (const e of readStore(dir, file).entries) {
+    const b = bigrams(norm(e))
+    if (b.size === 0) continue
+    let inter = 0
+    for (const g of a) if (b.has(g)) inter += 1
+    const ratio = inter / Math.max(1, Math.min(a.size, b.size))
+    if (ratio >= 0.5) out.push({ entry: e, ratio: Math.round(ratio * 100) })
+  }
+  return out.sort((x, y) => y.ratio - x.ratio).slice(0, 5)
+}
+
+/** 整库导出（换机器 / 备份 / 贴给别人）。 */
+function exportAll(cfg) {
+  return {
+    ok: true,
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    memoryDir: cfg.memoryDir,
+    files: cfg.files.map((f) => ({ name: f.name, entries: readStore(cfg.memoryDir, f.name).entries })),
+  }
+}
+
+/** 整库导入：merge = 只加没有的（去重）；replace = 整份覆盖。 */
+function importAll(cfg, data, mode = 'merge') {
+  if (!data || !Array.isArray(data.files)) return { ok: false, error: '数据格式不对（要 { files: [...] }）' }
+  const report = []
+  for (const item of data.files) {
+    const file = cfg.files.find((f) => f.name === item?.name)?.name
+    if (!file) {
+      report.push({ file: item?.name || '?', skipped: '不认识的记忆文件' })
+      continue
+    }
+    const incoming = Array.isArray(item.entries) ? item.entries.filter((e) => typeof e === 'string' && e.trim()) : []
+    if (mode === 'replace') {
+      const res = writeMemory(cfg, { target: TARGET_FILE.user === file ? 'user' : 'memory', action: 'set', entries: incoming })
+      report.push({ file, ok: res.ok, mode: 'replace', count: incoming.length, error: res.error })
+    } else {
+      const cur = readStore(cfg.memoryDir, file).entries
+      const add = incoming.filter((e) => !cur.includes(e.trim()))
+      const res = writeMemory(cfg, {
+        target: TARGET_FILE.user === file ? 'user' : 'memory',
+        action: 'set',
+        entries: [...cur, ...add],
+      })
+      report.push({ file, ok: res.ok, mode: 'merge', added: add.length, error: res.error })
+    }
+  }
+  return { ok: true, report }
+}
+
+/** 重建索引：先跑 dump（node，自带），再跑 index（python，有就跑）。 */
+function reindex(cfg) {
+  return new Promise((resolve) => {
+    const here = path.dirname(fileURLToPath(import.meta.url))
+    const dumpScript = path.join(here, 'scripts', 'dsh-memory-dump.mjs')
+    const indexPath = path.join(here, 'scripts', 'dsh-memory-index.py')
+    const log = []
+
+    const run = (cmd, args, timeoutMs = 180000) =>
+      new Promise((res) => {
+        let out = ''
+        let child
+        try {
+          child = spawn(cmd, args, {
+            cwd: cfg.memoryDir,
+            env: { ...process.env, [AUTO_ENV]: '1' },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            shell: process.platform === 'win32',
+            windowsHide: true,
+          })
+        } catch (e) {
+          return res({ ok: false, error: e.message })
+        }
+        const timer = setTimeout(() => {
+          try {
+            child.kill()
+          } catch {
+            /* 已退出 */
+          }
+          res({ ok: false, error: '超时' })
+        }, timeoutMs)
+        child.stdout?.on('data', (d) => {
+          out += d
+        })
+        child.stderr?.on('data', (d) => {
+          out += d
+        })
+        child.on('error', (e) => {
+          clearTimeout(timer)
+          res({ ok: false, error: e.message })
+        })
+        child.on('close', (code) => {
+          clearTimeout(timer)
+          res({ ok: code === 0, code, tail: out.trim().split(/\r?\n/).slice(-6).join('\n') })
+        })
+      })
+
+    ;(async () => {
+      if (!existsSync(dumpScript)) {
+        log.push('没有 scripts/dsh-memory-dump.mjs，跳过 dump')
+      } else {
+        const r = await run(process.execPath, [dumpScript])
+        log.push(`dump：${r.ok ? '成功' : '失败 ' + (r.error || r.code)}${r.tail ? '\n' + r.tail : ''}`)
+      }
+      if (!existsSync(indexPath)) {
+        log.push('没有 scripts/dsh-memory-index.py，跳过建索引')
+      } else {
+        const py = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3')
+        const r = await run(py, [indexPath, 'build'])
+        log.push(`index：${r.ok ? '成功' : '失败（没装 python？）' + (r.error || r.code)}${r.tail ? '\n' + r.tail : ''}`)
+      }
+      resolve({ ok: true, log: log.join('\n\n') })
+    })()
+  })
+}
+
 function listSessions(cfg, limit = 50) {
   const { db, error } = openIndex(cfg.memoryDir)
   if (error) return { ok: false, error }
@@ -879,6 +1129,65 @@ function registerHttp(ctx, cfg) {
                 state: saved.ok ? statePayload(cfg) : undefined,
               })
             }
+            // 最近一轮手动提炼（自动开关关着也能用）
+            if (req.method === 'POST' && route === '/capture') {
+              if (!lastTurnRef) {
+                return sendJson(res, 400, { ok: false, error: '还没抓到可提炼的一轮 —— 先聊一轮再来' })
+              }
+              const body = renderTurnForCapture(lastTurnRef.session, lastTurnRef.event)
+              if (!body) return sendJson(res, 400, { ok: false, error: '这一轮没有可提炼的内容' })
+              const text = await runHeadlessExtract(EXTRACT_PROMPT(body), cfg)
+              if (!text) {
+                return sendJson(res, 502, { ok: false, error: '提炼没返回 —— headless agent 起不来，或模型没回话' })
+              }
+              const parsed = parseExtract(text)
+              persistExtract(ctx, cfg, parsed)
+              return sendJson(res, 200, { ok: true, ...parsed, state: statePayload(cfg) })
+            }
+
+            // 备份清单 / 恢复
+            if (req.method === 'GET' && route === '/backups') {
+              const file = url.searchParams.get('file') || 'MEMORY.md'
+              return sendJson(res, 200, { ok: true, file, backups: listBackups(cfg.memoryDir, file) })
+            }
+            if (req.method === 'POST' && route === '/restore') {
+              const body = await readJsonBody(req)
+              const file = body.file === 'USER.md' ? 'USER.md' : 'MEMORY.md'
+              const r = restoreBackup(cfg.memoryDir, file, body.name)
+              return sendJson(res, r.ok ? 200 : 400, { ...r, state: r.ok ? statePayload(cfg) : undefined })
+            }
+
+            // 第 3 层下钻：某个会话的完整对话
+            if (req.method === 'GET' && route === '/session') {
+              return sendJson(res, 200, sessionDetail(cfg, url.searchParams.get('id')))
+            }
+
+            // 加条目前的相似检测
+            if (req.method === 'GET' && route === '/similar') {
+              const file = url.searchParams.get('file') === 'USER.md' ? 'USER.md' : 'MEMORY.md'
+              return sendJson(res, 200, {
+                ok: true,
+                file,
+                similar: findSimilar(cfg.memoryDir, file, url.searchParams.get('text') || ''),
+              })
+            }
+
+            // 导出 / 导入
+            if (req.method === 'GET' && route === '/export') {
+              return sendJson(res, 200, exportAll(cfg))
+            }
+            if (req.method === 'POST' && route === '/import') {
+              const body = await readJsonBody(req)
+              const r = importAll(cfg, body.data, body.mode === 'replace' ? 'replace' : 'merge')
+              return sendJson(res, r.ok ? 200 : 400, { ...r, state: r.ok ? statePayload(cfg) : undefined })
+            }
+
+            // 重建索引（dump + build）
+            if (req.method === 'POST' && route === '/reindex') {
+              const r = await reindex(cfg)
+              return sendJson(res, 200, r)
+            }
+
             return sendJson(res, 404, { ok: false, error: `unknown ${req.method} ${route}` })
           } catch (e) {
             return sendJson(res, 500, { ok: false, error: e?.message ?? String(e) })
