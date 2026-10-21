@@ -403,8 +403,15 @@ function registerSearchTool(ctx, cfg) {
 
 const TARGET_FILE = { user: 'USER.md', memory: 'MEMORY.md' }
 
+/**
+ * 某份文件当前生效的字符上限。
+ * 优先级：面板里改过的（.settings.json 的 limits）> cordis.patch.yml 的 files[].maxChars > 默认。
+ * 上限是用户的东西，不该被代码写死。
+ */
 function maxCharsOf(cfg, file) {
-  return cfg.files.find((f) => f.name === file)?.maxChars ?? 2200
+  const base = cfg.files.find((f) => f.name === file)?.maxChars ?? 2200
+  const override = readLocalSettings(cfg.memoryDir)?.limits?.[file]
+  return Number.isFinite(override) && override > 0 ? override : base
 }
 
 /** 统一写入口；工具和自动回填共用，保证预算口径一致。 */
@@ -761,11 +768,46 @@ function statePayload(cfg) {
       return {
         name: f.name,
         heading: f.heading,
-        maxChars: f.maxChars ?? 2200,
+        // 给的是「当前生效」的上限：面板改过就是改过的那个
+        maxChars: maxCharsOf(cfg, f.name),
         chars: body.trim().length,
         entries: st.entries,
       }
     }),
+  }
+}
+
+/** 中期记忆（第 2 层）目录视图：最近会话 + 摘要。 */
+function listSessions(cfg, limit = 50) {
+  const { db, error } = openIndex(cfg.memoryDir)
+  if (error) return { ok: false, error }
+  try {
+    const rows = db
+      .prepare(
+        `select s.id, s.title, s.project, s.created_at, s.msg_count, x.summary
+         from sessions s left join session_summaries x on x.session_id = s.id
+         order by s.created_at desc limit ?`,
+      )
+      .all(Math.max(1, Math.min(Number(limit) || 50, 300)))
+    const total = db.prepare('select count(*) c from sessions').get()?.c ?? rows.length
+    const withSummary = db.prepare('select count(*) c from session_summaries').get()?.c ?? 0
+    return {
+      ok: true,
+      total,
+      withSummary,
+      sessions: rows.map((r) => ({
+        id: r.id,
+        title: r.title || '(无标题)',
+        project: r.project || '',
+        created: fmtTime(r.created_at),
+        msgs: r.msg_count || 0,
+        summary: r.summary || null,
+      })),
+    }
+  } catch (e) {
+    return { ok: false, error: e.message }
+  } finally {
+    db.close?.()
   }
 }
 
@@ -788,10 +830,29 @@ function registerHttp(ctx, cfg) {
             if (req.method === 'GET' && route === '/state') {
               return sendJson(res, 200, statePayload(cfg))
             }
+            // 中期记忆：最近会话 + 摘要（面板里的「会话摘要」页）
+            if (req.method === 'GET' && route === '/sessions') {
+              return sendJson(res, 200, listSessions(cfg, Number(url.searchParams.get('limit')) || 50))
+            }
+            // 面板里的搜索框，和模型用的 memory_search 同一套逻辑
+            if (req.method === 'GET' && route === '/search') {
+              return sendJson(
+                res,
+                200,
+                searchMemory(cfg.memoryDir, {
+                  query: url.searchParams.get('q') || '',
+                  after: url.searchParams.get('after') || undefined,
+                  limit: Number(url.searchParams.get('limit')) || 5,
+                }),
+              )
+            }
             if (req.method === 'POST' && route === '/write') {
               const body = await readJsonBody(req)
               const res1 = writeMemory(cfg, body)
-              return sendJson(res, res1.ok ? 200 : 400, { ...res1, state: res1.ok ? statePayload(cfg) : undefined })
+              return sendJson(res, res1.ok ? 200 : 400, {
+                ...res1,
+                state: res1.ok ? statePayload(cfg) : undefined,
+              })
             }
             if (req.method === 'POST' && route === '/config') {
               const body = await readJsonBody(req)
@@ -800,8 +861,23 @@ function registerHttp(ctx, cfg) {
                 patchObj.autoCapture = body.autoCapture
                 cfg.autoCapture = body.autoCapture // 立刻生效，不用重启
               }
+              // 上限可改：{ limits: { 'USER.md': 4000 } } —— 逐文件合并，不互相覆盖
+              if (body.limits && typeof body.limits === 'object') {
+                const cur = readLocalSettings(cfg.memoryDir)?.limits || {}
+                const merged = { ...cur, ...body.limits }
+                for (const [k, v] of Object.entries(merged)) {
+                  const n = Number(v)
+                  if (Number.isFinite(n) && n > 0) merged[k] = Math.round(n)
+                  else delete merged[k]
+                }
+                patchObj.limits = merged
+              }
               const saved = writeLocalSettings(cfg.memoryDir, patchObj)
-              return sendJson(res, saved.ok ? 200 : 500, { ...saved, autoCapture: cfg.autoCapture })
+              return sendJson(res, saved.ok ? 200 : 500, {
+                ...saved,
+                autoCapture: cfg.autoCapture,
+                state: saved.ok ? statePayload(cfg) : undefined,
+              })
             }
             return sendJson(res, 404, { ok: false, error: `unknown ${req.method} ${route}` })
           } catch (e) {
