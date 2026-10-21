@@ -220,6 +220,45 @@ node selfcheck.mjs
 **3. 空会话不会有摘要。**
 `msg_count = 0` 的会话本来就没内容可提炼，报「N 个会话只有 M 条摘要」时这是正常的，不是失败。
 
+**4. cordis 的 `inject` 是硬依赖，不是「有就用」。**
+`export const inject = ['webServer']` 写在插件顶层，意思是「这些服务全部就绪，才准调我的 `apply()`」。
+只要有一个服务没就绪，fibre 就永远停在 `PENDING`，`apply()` 一次都不会执行，
+而且**完全静默**——模块顶层照跑、你的探针只有「模块已加载」一行，现象和「插件根本没被加载」一模一样。
+
+更坑的是服务是**晚一步**就绪的：实测本插件 `apply()` 那一刻 `webServer`/`tools` 都还是 `false`，
+约 4 秒后别的插件才拿到。所以别在 `apply()` 里用 `ctx.get()` 赌它已经有了。
+
+正解：
+```js
+export const inject = []                    // 主 apply 不阻塞
+ctx.inject(['webServer'], (sub) => {...})   // 等就绪再挂，cordis 保证
+```
+
+**5. `ctx` 是代理，读没声明的服务属性会直接抛。**
+```
+Error: cannot get property "webServer" without inject
+```
+`ctx.webServer`、`ctx.tools.register(...)` 这种写法在 `inject = []` 下**当场炸**——连你写的探针都会炸。
+一律用 `ctx.get('webServer')`：取不到返回 `undefined`，不抛错。
+
+**6. Windows 上 `spawn` 多行 prompt 会被 cmd.exe 截断。**
+`dsh` 在 Windows 上是 `.cmd` 壳，`spawn` 它必须 `shell: true`，而 shell 走的是 `cmd.exe` ——
+**cmd.exe 把换行当成命令分隔符**。多行 prompt 塞进 argv，只有第一行成了位置参数，
+后面的内容全丢（实测只送进去 42 个字符，模型回「没有内容」）。
+
+这个坑伪装得极像「解析器坏了」：明明有对话，提炼结果永远是 0 条。
+正解是走 stdin：
+
+```js
+const child = spawn('dsh', ['--profile', 'headless'], {
+  shell: true, stdio: ['pipe', 'pipe', 'pipe'],
+})
+child.stdin.end(prompt, 'utf8')   // prompt 不进命令行，换行随便
+```
+
+（试过并不可行的：直接 spawn `DeepSeek Harness.exe` + `cli.js` 绕开 shell —— 完全没输出；
+让模型读临时文件 —— headless profile 里没有 `tool-fs`；把换行换成空格 —— body 上限 6000 会顶到 cmd 的 8191。）
+
 ## 测试
 
 ```bash
