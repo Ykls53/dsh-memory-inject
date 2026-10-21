@@ -16,6 +16,18 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { apply } from './index.js'
+import { createRequire } from 'node:module'
+
+// 先同步加载一次：插件是按同步模块加载的，模块顶层出现 await 会被判定成异步模块，
+// 整个插件不装载 —— apply() 一次都不会被调用，也不报可读错误（2026-10-21 就是栽在这）。
+try {
+  const req = createRequire(import.meta.url)
+  const m = req('./index.js')
+  console.log(`✓ 模块可同步加载（无顶层 await）｜inject = ${JSON.stringify(m.inject)}`)
+} catch (e) {
+  console.error('✗ 模块无法同步加载 —— 检查 index.js 顶层有没有 await：', e.message.split('\n')[0])
+  process.exit(1)
+}
 
 const realDir = process.argv[2] || path.join(os.homedir(), '.dsh', 'memories')
 const BASE = '/api/memory-inject'
