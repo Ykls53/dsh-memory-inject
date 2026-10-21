@@ -45,6 +45,15 @@ const ctx = {
       routeSpec = spec
     },
   },
+  // 真 cordis 的契约：读服务属性走 ctx.get()，等依赖就绪用 ctx.inject()。
+  // 自检里所有服务当场都在，所以 inject 直接同步回调。
+  get(name) {
+    return ctx[name]
+  },
+  inject(deps, cb) {
+    cb(ctx)
+    return null
+  },
 }
 
 apply(ctx, { memoryDir: realDir })
@@ -135,22 +144,27 @@ const tmp = mkdtempSync(path.join(os.tmpdir(), 'memselfcheck-'))
 writeFileSync(path.join(tmp, 'USER.md'), '原有条目\n', 'utf-8')
 writeFileSync(path.join(tmp, 'MEMORY.md'), '环境条目\n', 'utf-8')
 const tmpRoute = { spec: null }
-apply(
-  {
-    on() {},
-    effect(fn) {
-      fn()
-    },
-    logger: { info() {}, warn() {}, error() {} },
-    tools: { register() {} },
-    webServer: {
-      register(spec) {
-        tmpRoute.spec = spec
-      },
+const tmpCtx = {
+  on() {},
+  effect(fn) {
+    fn()
+  },
+  logger: { info() {}, warn() {}, error() {} },
+  tools: { register() {} },
+  webServer: {
+    register(spec) {
+      tmpRoute.spec = spec
     },
   },
-  { memoryDir: tmp },
-)
+  get(name) {
+    return tmpCtx[name]
+  },
+  inject(deps, cb) {
+    cb(tmpCtx)
+    return null
+  },
+}
+apply(tmpCtx, { memoryDir: tmp })
 
 const tmpServer = createServer((req, res) => {
   Promise.resolve(tmpRoute.spec.handler(req, res)).catch(() => {

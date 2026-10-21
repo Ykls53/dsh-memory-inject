@@ -54,6 +54,27 @@ try {
 
 const PLUGIN_NAME = 'dsh-memory-inject'
 
+/**
+ * 装载观测（诊断用，成本几乎为零）。
+ * DSH 桌面端没有可读的启动日志，插件不加载时完全静默 —— 只能让它自己写下来：
+ *   .load.log 里出现「模块已加载」     → 插件被 loader 取到了，问题在 apply 之后
+ *   .load.log 里出现「apply 被调用」   → 进了 apply，看它后面的服务状态
+ *   两行都没有                        → 插件根本没被 loader 取到（安装/登记问题）
+ */
+function _probe(msg) {
+  try {
+    const dir = path.join(os.homedir(), '.dsh', 'memories')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, '.load.log'), `[${new Date().toISOString()}] ${msg}\n`, {
+      flag: 'a',
+    })
+  } catch {
+    /* 观测失败不影响主流程 */
+  }
+}
+
+_probe('index.js 模块已加载')
+
 /** 插件版本：从自己的 package.json 读，面板拿它判断「后端是不是旧代码」。 */
 const PLUGIN_VERSION = (() => {
   try {
@@ -65,9 +86,30 @@ const PLUGIN_VERSION = (() => {
 })()
 const SOURCE_KIND = `plugin:${PLUGIN_NAME}`
 
-/** 需要的 DSH 服务；只声明真正用到的，缺了会被框架拦在 apply 之前。 */
-// 只要最小集合：多声明一个不存在的服务 = 整个插件不装载（2026-10-21 踩过，连注入都跟着没了）
-export const inject = ['agents', 'tools', 'webServer']
+/**
+ * 插件 id —— **必须导出**，且要和 cordis.patch.yml 里 insert 的 `id` 一致。
+ * 不导出它，cordis 无法把模块和 profile 里那条插件行对上：
+ * 模块会被 import（顶层代码照跑、探针会写日志），但 apply() 永远不被调用 ——
+ * 现象是「设置里能看见面板，接口全 not found」。2026-10-21 卡了一整天的最后一个坑。
+ */
+export const name = 'memory-inject'
+
+/**
+ * 需要的 DSH 服务。
+ *
+ * cordis 的语义是「声明的服务**全部就绪**才把 fiber 从 PENDING 推到 ACTIVE，才调用 apply」。
+ * 换句话说：inject 里写了一个拿不到的名字 = apply 永远不执行，而且完全静默
+ * （模块顶层照跑、探针只有「模块已加载」一行，现象和「插件没被加载」一模一样）。
+ * 这是 2026-10-21～22 卡了两天、重启快十次的根因。
+ *
+ * 重要：cordis 的 inject 是**硬依赖**，没有「有就用」这种软依赖写法。
+ * 所以这里只用空数组 + 运行时手动取服务，见 apply 里的 ctx.get('webServer')。
+ *
+ * ⚠️ 别再把它改回 ['webServer']：桌面端的 webServer 服务在插件 ctx 里拿不到，
+ *    写上去就会把整个插件（含记忆注入）一起卡死在 PENDING。
+ *    要恢复硬依赖，先在 diagnostics 里确认 `ctx.get('webServer')` 真的返回对象。
+ */
+export const inject = []
 
 const DEFAULTS = {
   // 记忆目录；默认 ~/.dsh/memories
@@ -178,9 +220,33 @@ async function makeMemoryMessage(ctx, text) {
  * @param config 见 DEFAULTS
  */
 export function apply(ctx, config = {}) {
+  // 探针 2：证明 apply 真的被调用了（放在 env 判断之前，否则被 return 掉就什么都看不到）。
+  // 同时打出守卫变量的实际值 —— 如果它确实是 '1'，apply 会在下面静默返回，
+  // 现象和「apply 没被调用」一模一样。2026-10-22 加的。
+  _probe(
+    `apply 被调用（进函数第一行）｜AUTO_ENV=${JSON.stringify(process.env.DSH_MEMORY_INJECT_SUMMARIZE)}`,
+  )
+
   // 自动回填会 spawn 一个 headless agent，它也会装载本插件。
   // 见到这个标记就直接退出，否则提炼出来的会话又被抓一遍，无限循环。
   if (process.env[AUTO_ENV] === '1') return
+
+  // ⚠️ 取服务一律用 ctx.get(name)，**不能写 ctx.webServer**：
+  //    cordis 的 ctx 是代理，访问一个没在 inject 里声明的属性会直接抛
+  //    `Error: cannot get property "webServer" without inject` —— 连探针自己都会炸。
+  //    ctx.get() 走 reflect，取不到就返回 undefined，安全。2026-10-22 踩到。
+  const svc = (n) => {
+    try {
+      return ctx?.get?.(n)
+    } catch {
+      return undefined
+    }
+  }
+  _probe(
+    `apply 被调用｜服务：webServer=${!!svc('webServer')} tools=${!!svc('tools')} ` +
+      `agents=${!!svc('agents')} settings=${!!svc('settings')} effect=${typeof ctx?.effect} ` +
+      `logger=${typeof ctx?.logger} config=${JSON.stringify(config)}`,
+  )
 
   const cfg = normalizeConfig(config)
   // 面板里改过的开关存在 .settings.json，优先级高于 cordis.patch.yml
@@ -258,11 +324,43 @@ export function apply(ctx, config = {}) {
   })
 
   // ── 其余能力：任何一个挂了都不影响上面的注入 ──
-  guard('memory_search 工具', () => registerSearchTool(ctx, cfg))
-  guard('memory_remember 工具', () => registerWriteTool(ctx, cfg))
-  guard('自动回填', () => applyAutoCapture(ctx, cfg))
-  guard('面板接口', () => registerHttp(ctx, cfg))
+  //
+  // 这里**不能**直接调用、也不能光靠 ctx.get()：
+  // 实测（2026-10-22）本插件 apply 时 webServer / tools 还没就绪，
+  // 4 秒后 bili-scroll 才拿到它们 —— 服务是「晚一步」提供的。
+  //
+  // 正确姿势是 ctx.inject(deps, cb)：cordis 会把 cb 挂起，等这些服务**全部就绪**
+  // 才调用它（dsh-api-gateway / dsh-client-connection 都是这么写的）。
+  // 好处：主 apply 不被阻塞（记忆注入立刻生效），接口和工具等就绪后自动挂上。
+  const whenReady = (deps, label, fn) => {
+    guard(label, () => {
+      if (typeof ctx?.inject !== 'function') {
+        // 极老版本的 cordis 没有 ctx.inject，退化成当场试一次
+        _probe(`[${label}] 没有 ctx.inject，退化成立即调用`)
+        fn(ctx)
+        return
+      }
+      _probe(`[${label}] 登记 ctx.inject(${JSON.stringify(deps)})`)
+      ctx.inject(deps, (sub) => {
+        // 回调触发 = 这些服务真的就绪了（cordis 保证）
+        _probe(`[${label}] ctx.inject 回调触发｜服务=${typeof sub?.get === 'function' ? deps.map((d) => `${d}=${!!sub.get(d)}`).join(' ') : 'no-get'}`)
+        try {
+          fn(sub)
+          _probe(`[${label}] 挂载完成`)
+        } catch (e) {
+          _probe(`[${label}] 挂载失败：${e?.message || e}`)
+          ctx.logger?.warn?.(`[${PLUGIN_NAME}] ${label} 挂载失败（其余功能继续）：${e?.message || e}`)
+        }
+      })
+    })
+  }
 
+  whenReady(['tools'], 'memory_search 工具', (c) => registerSearchTool(c, cfg))
+  whenReady(['tools'], 'memory_remember 工具', (c) => registerWriteTool(c, cfg))
+  guard('自动回填', () => applyAutoCapture(ctx, cfg))
+  whenReady(['webServer'], '面板接口', (c) => registerHttp(c, cfg))
+
+  _probe('apply 完成，全部功能注册走完')
   ctx.logger?.info?.(`[${PLUGIN_NAME}] 已装载，记忆目录 ${cfg.memoryDir}`)
 }
 
@@ -415,7 +513,15 @@ async function resolveDefineTool() {
 
 /** 把 memory_search 注册成模型可调用的工具。失败了只记日志，不影响注入。 */
 function registerSearchTool(ctx, cfg) {
-  if (!ctx.tools || typeof ctx.tools.register !== 'function') {
+  // ctx.get() 而不是 ctx.tools —— 没 inject 时读属性会抛（见 apply 里的说明）。
+  const tools = (() => {
+    try {
+      return ctx?.get?.('tools')
+    } catch {
+      return undefined
+    }
+  })()
+  if (!tools || typeof tools.register !== 'function') {
     ctx.logger?.warn?.(`[${PLUGIN_NAME}] 没有 tools 服务，memory_search 未注册`)
     return
   }
@@ -441,7 +547,7 @@ function registerSearchTool(ctx, cfg) {
         },
       }
       try {
-        ctx.tools.register(defineTool(spec))
+        tools.register(defineTool(spec))
         ctx.logger?.info?.(`[${PLUGIN_NAME}] memory_search 已注册`)
       } catch (e) {
         ctx.logger?.warn?.(`[${PLUGIN_NAME}] memory_search 注册失败：${e.message}`)
@@ -498,7 +604,15 @@ function writeMemory(cfg, { target, action, content, oldText, newText, operation
 }
 
 function registerWriteTool(ctx, cfg) {
-  if (!ctx.tools || typeof ctx.tools.register !== 'function') return
+  // 同 registerSearchTool：一律走 ctx.get()，别读 ctx.tools。
+  const tools = (() => {
+    try {
+      return ctx?.get?.('tools')
+    } catch {
+      return undefined
+    }
+  })()
+  if (!tools || typeof tools.register !== 'function') return
   resolveDefineTool()
     .then((defineTool) => {
       const spec = {
@@ -531,7 +645,7 @@ function registerWriteTool(ctx, cfg) {
         },
       }
       try {
-        ctx.tools.register(defineTool(spec))
+        tools.register(defineTool(spec))
         ctx.logger?.info?.(`[${PLUGIN_NAME}] memory_remember 已注册`)
       } catch (e) {
         ctx.logger?.warn?.(`[${PLUGIN_NAME}] memory_remember 注册失败：${e.message}`)
@@ -1129,7 +1243,15 @@ function listSessions(cfg, limit = 50) {
 }
 
 function registerHttp(ctx, cfg) {
-  if (!ctx.webServer || typeof ctx.webServer.register !== 'function') {
+  // 用 ctx.get()，不能写 ctx.webServer —— 没 inject 的话那句会直接抛错（见 apply 里的说明）。
+  const webServer = (() => {
+    try {
+      return ctx?.get?.('webServer')
+    } catch {
+      return undefined
+    }
+  })()
+  if (!webServer || typeof webServer.register !== 'function') {
     ctx.logger?.warn?.(`[${PLUGIN_NAME}] 没有 webServer 服务，设置面板的接口没挂上`)
     return
   }
@@ -1137,7 +1259,7 @@ function registerHttp(ctx, cfg) {
 
   ctx.effect?.(
     () =>
-      ctx.webServer.register({
+      webServer.register({
         kind: 'prefix',
         path: base,
         handler: async (req, res) => {
@@ -1266,4 +1388,7 @@ function registerHttp(ctx, cfg) {
   ctx.logger?.info?.(`[${PLUGIN_NAME}] 面板接口已挂 ${base}`)
 }
 
-export default { apply, inject }
+// 注意：这里**不要**写 `export default { apply, inject }`。
+// 对照能正常工作的插件（dsh-bili-scroll）：它只有命名导出（name / inject / Config / apply），
+// 没有 default。多一个 default 会让加载器取到 `mod.default`，而那里没有 name，
+// 结果就是模块被 import 了、apply 却永远不被调用。2026-10-21 的最后一个坑。

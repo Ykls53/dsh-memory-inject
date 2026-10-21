@@ -46,8 +46,8 @@ function withMemoryDir(files) {
 
 test('正常注入：把 USER.md 和 MEMORY.md 拼成一条消息', async () => {
   const dir = withMemoryDir({
-    'USER.md': '主人自称伊卡洛斯。\n§\n讨厌客套话。',
-    'MEMORY.md': '工作区在 D:\\deepseekDAIGirlfriend。',
+    'USER.md': '用户是位后端工程师。\n§\n讨厌客套话。',
+    'MEMORY.md': '工作区在 D:\\projects\\demo。',
   })
   try {
     const decision = await runPreStep({ memoryDir: dir }, [{ role: 'user', content: [] }])
@@ -55,8 +55,8 @@ test('正常注入：把 USER.md 和 MEMORY.md 拼成一条消息', async () => 
     const injected = decision.messages[1]
     assert.strictEqual(injected.source.kind, SOURCE_KIND)
     const text = injected.content[0].text
-    assert.match(text, /伊卡洛斯/)
-    assert.match(text, /deepseekDAIGirlfriend/)
+    assert.match(text, /后端工程师/)
+    assert.match(text, /projects\\demo/)
     assert.match(text, /不是新的用户输入/, '应当带上「这是记忆不是新输入」的说明')
   } finally {
     rmSync(dir, { recursive: true, force: true })

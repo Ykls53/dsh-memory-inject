@@ -2,3 +2,14 @@ node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# npm pack 产物（每次改完都会生成，不进仓库）
+*.tgz
+
+# 本地记忆数据 / 备份，绝不外传
+.backup/
+.memories/
+*.db
+*.db-shm
+*.db-wal
+

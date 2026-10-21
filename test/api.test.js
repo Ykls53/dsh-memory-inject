@@ -40,6 +40,13 @@ function makeCtx() {
       ctx.route = spec
     },
   }
+  // 真 cordis 的 ctx：读服务属性要走 ctx.get()，等依赖就绪要用 ctx.inject()。
+  // 这里用假 ctx 模拟同样的契约 —— inject 里的服务当场都在，所以同步回调即可。
+  ctx.get = (name) => ctx[name]
+  ctx.inject = (deps, cb) => {
+    cb(ctx)
+    return null
+  }
   return ctx
 }
 
