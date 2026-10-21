@@ -12,6 +12,12 @@
 window.__ModuleLoader__.load({
   id: 'dsh-memory-inject',
   factory: (require) => {
+    // 诊断用：面板不出现时，看控制台有没有这一行就能判断是「没加载」还是「注册失败」
+    try {
+      console.log('[dsh-memory-inject] client bundle loaded')
+    } catch {
+      /* 某些环境没有 console */
+    }
     const React = require('react')
     const h = React.createElement
     const { useState, useEffect, useCallback } = React
@@ -65,12 +71,14 @@ window.__ModuleLoader__.load({
     const warnBox = { ...card, borderColor: 'rgba(209,67,67,.5)', background: 'rgba(209,67,67,.06)', padding: 12 }
 
     async function getJson(path) {
-      const r = await fetch(API + path)
+      // 必须带 same-origin 凭证：DSH 的 web 接口有鉴权，裸 fetch 会 401
+      const r = await fetch(API + path, { credentials: 'same-origin' })
       return r.json()
     }
     async function post(path, body) {
       const r = await fetch(API + path, {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
       })

@@ -59,7 +59,8 @@ const PLUGIN_VERSION = (() => {
 const SOURCE_KIND = `plugin:${PLUGIN_NAME}`
 
 /** 需要的 DSH 服务；只声明真正用到的，缺了会被框架拦在 apply 之前。 */
-export const inject = ['agents', 'tools', 'webServer']
+// settings 必须有：设置页的 section 挂在它上面，漏了整块面板都不会出现（2026-10-21 踩的坑）
+export const inject = ['agents', 'tools', 'webServer', 'settings']
 
 const DEFAULTS = {
   // 记忆目录；默认 ~/.dsh/memories
