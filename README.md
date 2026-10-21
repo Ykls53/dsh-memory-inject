@@ -1,121 +1,156 @@
 # dsh-memory-inject
 
-**给 DeepSeek Harness 加一层「永远在场」的记忆。**
+**给 DeepSeek Harness 加一套「记得住」的记忆：三层，一处也不用你操心。**
 
-大多数 agent 记忆插件做的是**检索**：先把对话存成流水账，下次靠语义搜索捞回来。
-这个插件做的是另一件事：把一小份**结论型事实**在每个会话里直接摆到模型面前，不搜、不等、不花一个 token 去生成。
+大多数 agent 记忆插件只做检索：把对话存成流水账，下次靠语义搜索捞回来。
+这套东西做的是三件事叠在一起 —— 短的常驻、中的会攒、长的能翻。
 
-> Inject `USER.md` / `MEMORY.md` as fixed, always-on memory into DeepSeek Harness
-> sessions. No embedding, no retrieval, no LLM call — just curated facts that are
-> present from the first step of every session.
+> Three-layer memory for DeepSeek Harness: always-on curated facts (`USER.md` /
+> `MEMORY.md`), per-session summaries, and full-text recall over every past
+> session. Injection costs zero model calls; the auto-capture layer uses
+> whatever model you've already picked in the UI.
 
 ---
 
-## 为什么需要它
-
-向量检索型记忆有个天花板：它只能回答「哪段原文提到过 X」。它回答不了
-「这个人喜欢怎么被说话」「这台机器改配置前要先跑哪个脚本」——因为答案不是某段原文，
-而是一条**经过提炼的结论**。而结论，恰恰是检索最不擅长的东西：你搜它，你得先知道搜什么。
-
-固定注入解决的就是这个：不用搜，一直在。
-
-| | 检索型（memsearch 等） | 本插件 |
-|---|---|---|
-| 存什么 | 对话原文 / 摘要 | 提炼过的事实条目 |
-| 什么时候用 | 想到要搜才用 | 每个会话开头自动在场 |
-| 花模型调用吗 | 存的时候要（摘要/嵌入） | **不花** |
-| 适合 | 「上周那个方案最后定的是啥」 | 「这人讨厌什么」「这机器有什么坑」 |
-
-两者不冲突，是互补的：一个管**找得到**，一个管**记得住**。
-
-## 工作原理
+## 三层是什么
 
 ```
-会话开始
-  └─ agent/pre-step（每轮第一步模型调用前）
-       ├─ 历史里已经有本插件注入的消息？ → 有，跳过
-       └─ 没有 → 读 USER.md + MEMORY.md → 拼成一条消息塞进 messages
+第 1 层  常驻注入   USER.md + MEMORY.md              每个会话开头自动在场
+                   ↓ 一轮结束时提炼新事实写回
+第 2 层  会话摘要   每段对话 2~3 句，进 index.db      问「上周三聊了啥」先看这里
+                   ↓ 命中的那条会话可以下钻
+第 3 层  全量原文   所有会话正文 + FTS5 trigram 索引   真正想翻细节时用
 ```
 
-三个关键点：
+| | 第 1 层 | 第 2 层 | 第 3 层 |
+|---|---|---|---|
+| 存什么 | 提炼过的事实条目 | 每会话摘要 | 对话原文 |
+| 花模型吗 | 注入不花；写回才花 | 建索引时花 | **不花** |
+| 谁维护 | 模型自动回填 / 你手动改 | 索引脚本 | 索引脚本 |
+| 预算 | USER 1375 / MEMORY 2200 字符（硬上限） | 无 | 无 |
 
-1. **只挂 `agent/pre-step`**，不碰 system prompt、不装钩子到别的阶段，最小侵入。
-2. **靠 `source.kind` 去重**：注入的那条消息带 `plugin:dsh-memory-inject` 标记。
-   下一轮先查历史里有没有这个标记——有就不重复塞，所以不会每轮堆积。
-3. **上下文被压缩掉之后会自动补回来**：压缩把那条消息删了，标记也就没了，下一轮检测不到就重新注入。
-   这是刻意的设计——记忆不该因为上下文满了就消失。
+**为什么短的必须有硬上限**：第 1 层每个会话都要整份进上下文。它一旦膨胀，
+每个会话都在为「上次写的一堆废话」付 token。所以超预算直接拒绝写入，不截断、不偷偷丢。
+
+## 它给你的两个工具
+
+模型自己就能调，不用你开口教：
+
+| 工具 | 干什么 |
+|---|---|
+| `memory_search` | 搜过去：关键词 + 可选时间窗（`7d` / `24h` / `2w`）。按**会话**聚合返回标题、时间、命中片段、该会话摘要。问「上周三聊了什么」用的就是它 |
+| `memory_remember` | 记下来：`add` / `remove` / `replace` / `batch`。`batch` 可以在一次调用里先删旧的再加新的，**预算只算最终结果**（快满时能先瘦身再写） |
+
+写入有两条硬规矩：`replace` 的匹配必须唯一命中（多条命中就拒绝，不猜着改）；
+写前自动备份到 `<memoryDir>/.backup/`，只留最近 20 份。
+
+## 全自动回填
+
+一轮对话结束（`turn/end`）→ 把这一轮喂给一个一次性 agent 提炼 → 按 `USER:` / `ENV:` 分类写回文件。
+
+**用哪个模型？你自己的那个。** 它 spawn 的是 `dsh --profile headless`，
+而这个 agent 读 `~/.dsh/settings.yaml` 的 `agent-default-model` ——
+就是设置里模型选择器写的那个字段。你在 UI 里换成 OAI，它就用 OAI；换别的就跟着换。插件不碰你的 key。
+
+默认**关**。开法二选一：设置面板里点一下，或 `cordis.patch.yml` 里 `autoCapture: true`。
+
+递归保护：提炼子进程带 `DSH_MEMORY_INJECT_SUMMARIZE=1`，插件见到这个标记直接退出，
+免得「提炼出来的会话」又被抓一遍，无限循环。
+
+## 设置面板
+
+装完在「设置」左侧多一项 **记忆**（排在「刷B站」后面）：
+
+- 自动总结开关（开了立刻生效，不用重启）
+- 两份文件的条目列表：逐条改、逐条删、随手加
+- 实时显示字符数 / 上限，超了标红并且保存会被拒
+
+面板改的开关存在 `<memoryDir>/.settings.json`，优先级高于 `cordis.patch.yml` ——
+所以面板是「运行时开关」，patch 是「出厂默认」。
 
 ## 安装
 
 ```bash
-# 从 npm（发布后）
+# npm（发布后）
 dsh plugin --profile desktop add dsh-memory-inject
 
-# 从本地路径（开发时）
+# 本地路径（开发时）
 dsh plugin --profile desktop add /path/to/dsh-memory-inject
 ```
 
-装完 `dsh` 会自动把它登记进 `profile/package.json` 的 `dsh.profile.bundles`，
-并应用插件自带的 `cordis.patch.yml`。**重启 DSH 客户端后生效。**
+装完 `dsh` 会自动登记进 `profile/package.json` 的 `dsh.profile.bundles` 并应用自带的
+`cordis.patch.yml`。**开个新会话生效**（不必整个客户端重启）。
 
-## 记忆文件放哪
+## 记忆文件
 
-默认读 `~/.dsh/memories/`：
+默认 `~/.dsh/memories/`：
 
 ```
 ~/.dsh/memories/
-├── USER.md      用户是谁：称呼、脾气、偏好、反感
-└── MEMORY.md    环境事实：路径、端口、配置坑、常用命令
+├── USER.md        用户是谁：称呼、脾气、偏好、反感（预算 1375 字符）
+├── MEMORY.md      环境事实：路径、端口、坑、命令（预算 2200 字符）
+├── index.db       第 2/3 层的索引（由脚本生成）
+└── .backup/       每次写入前的自动备份
 ```
 
-格式是硬性的：**一行一条，条目之间用单独一行的 `§` 分隔**，不要标题、不要正文段落。
+格式是硬性的：**一行一条，条目之间单独一行 `§`**，不要标题、不要段落。
 
 ```markdown
 要求回答直接、只讲事实：反感公文腔、空话客套。
 
 §
 
-改任何配置前先备份、留回退命令；改完跑自检全绿才重启。
+改配置前先备份、留回退命令；改完跑自检全绿才重启。
 ```
 
-`§` 分隔不是洁癖：它是为了让后来更新记忆的工具（人也好、模型也好）能**按条目增删**，
-而不是整份重写——整份重写迟早会丢东西。
+`§` 不是为了好看：它让后来更新记忆的（人也好、模型也好）能**按条目增删**，
+而不是整份重写 —— 整份重写迟早丢东西。
+
+## 建索引（第 2/3 层）
+
+插件只**查**索引，不建索引。建索引用 `scripts/` 里两个脚本：
+
+```bash
+# 1) 把 DSH 所有会话转录（多帧 zstd）解压成 JSONL
+node scripts/dsh-memory-dump.mjs
+
+# 2) 建 FTS5 trigram 索引 → ~/.dsh/memories/index.db
+python scripts/dsh-memory-index.py build
+
+# 可选：给每个会话写 2~3 句摘要（要模型，慢）
+python scripts/dsh-memory-index.py search "关键词"      # 验证一下
+```
+
+**为什么用 trigram 不用默认分词**：默认的 `unicode61` 不支持中文（实测查询返回空），
+`trigram` 对中文精确命中（`QQ机器人` 一查就中）。整份索引 200 多个会话约 30 MB。
+
+**摘要那一步可以跳过** —— 第 1 层和第 3 层不依赖它，跳过只是少了「一眼看全会话」的目录视图。
 
 ## 配置
 
-写在 profile 的 `cordis.patch.yml` 里，用同一个 id 覆盖：
-
-```yaml
-- id: memory-inject
-  config:
-    memoryDir: 'D:\my-memory'      # 换记忆目录，默认 ~/.dsh/memories
-    maxTotalChars: 6000            # 注入总量预算（字符），默认 4000
-    turns: [1]                     # 只在第 1 轮注入；留空 = 每轮检查（推荐）
-    includePreamble: true          # 是否带「这是记忆不是新输入」的说明行
-    files:                         # 注哪些文件、按什么标题
-      - { name: 'USER.md',   heading: 'USER PROFILE (who the user is)' }
-      - { name: 'MEMORY.md', heading: 'MEMORY (your personal notes)' }
-```
+写在 profile 的 `cordis.patch.yml` 里，用 id `memory-inject` 覆盖：
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `memoryDir` | `~/.dsh/memories` | 记忆文件目录 |
-| `files` | USER.md / MEMORY.md | 顺序即注入顺序 |
-| `maxTotalChars` | 4000 | 超预算的文件**整份跳过**（不切半句） |
+| `memoryDir` | `~/.dsh/memories` | 记忆目录 |
+| `files[].maxChars` | USER 1375 / MEMORY 2200 | 每份文件的硬预算 |
+| `maxTotalChars` | 4000 | 单次注入的总预算，超出的文件整份跳过 |
 | `turns` | `[]` | 空 = 每轮检查去重；填 `[1]` = 只第一轮 |
-| `includePreamble` | `true` | 关掉只留正文（省 token，但模型可能把记忆当新输入） |
+| `includePreamble` | `true` | 是否带「这是记忆不是新输入」的说明行 |
+| `autoCapture` | `false` | 全自动回填开关 |
+| `captureTimeoutMs` | 180000 | 提炼子进程超时 |
 
 ## 设计上的取舍（说清楚，别踩）
 
 - **注入的是消息，不是 system prompt。** DSH 插件能通过 `agent/pre-step` 往 messages 里加东西，
-  但不能改 system prompt。所以记忆以一条带标记的用户消息出现——效果等价（都会进模型上下文），
-  代价是它在消息列表里可见，不是隐形的系统指令。
-- **零模型调用。** 读两个文件、拼字符串，没有 LLM、没有 embedding、没有网络。
-  所以每次会话的成本是「那几千字符」，不是钱。
-- **失败一律静默。** 目录不存在、文件读不了、编码坏了——插件跳过，不打断会话。
-  记忆是锦上添花，不该有资格弄崩一次对话。
-- **不自动写记忆。** 这份插件只管「注入」。谁来回填这两份文件（人工、还是另配一个后台提炼脚本），
-  是你的自由——把写入和注入拆开，是为了让两边都能单独替换。
+  改不了 system prompt。所以这份记忆以一条带 `plugin:dsh-memory-inject` 标记的用户消息出现 ——
+  效果等价（都进上下文、都在场），但它在消息列表里可见，不是隐形的系统指令。
+- **注入零模型调用。** 读文件、拼字符串，没有 LLM、没有 embedding、没有网络。
+- **去重靠 `source.kind`，不靠轮次计数。** 所以上下文被压缩掉之后标记消失，下一轮自动补回 ——
+  记忆不会因为上下文满了就没了。
+- **写盘不等于当前会话立刻变。** 本会话已经注入过那份快照，新写入下次开会话才读到。这是刻意的：
+  中途改记忆不该让本轮的提示跟着抖（前缀缓存友好）。
+- **回填失败一律静默 + 记日志。** 记忆是锦上添花，不该有资格弄崩一次对话。
 
 ## 测试
 
@@ -123,8 +158,10 @@ dsh plugin --profile desktop add /path/to/dsh-memory-inject
 npm test
 ```
 
-8 个用例，覆盖注入、去重、空目录、目录不存在、预算守门、step 过滤、turn 白名单、拒绝分支。
-全部离线，不装进 DSH 也能跑。
+17 个用例，全部离线（不需要装进 DSH）：
+
+- `test/inject.test.js` — 注入、去重、空目录、目录不存在、预算守门、step 过滤、turn 白名单、拒绝分支
+- `test/store.test.js` — 条目往返、预算拒绝、原子批量、remove 未命中整批失败、patch 唯一性、写前备份、重复不加
 
 ## 回退
 
@@ -132,7 +169,7 @@ npm test
 dsh plugin --profile desktop remove dsh-memory-inject
 ```
 
-然后重启客户端。记忆文件本身不受影响，删不删随你。
+记忆文件不受影响，删不删随你。
 
 ## 许可
 

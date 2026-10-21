@@ -28,4 +28,9 @@
         # turns: []
         # 是否带上「这是记忆不是新输入」的说明行
         # includePreamble: true
+        # 全自动回填：一轮结束就提炼事实写回（默认关；设置面板里也能开）
+        # 用的是 DSH 当前模型（settings.yaml 的 agent-default-model），换模型它跟着换
+        # autoCapture: true
+        # 提炼子进程超时（毫秒）
+        # captureTimeoutMs: 180000
         {}
