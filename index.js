@@ -59,8 +59,8 @@ const PLUGIN_VERSION = (() => {
 const SOURCE_KIND = `plugin:${PLUGIN_NAME}`
 
 /** 需要的 DSH 服务；只声明真正用到的，缺了会被框架拦在 apply 之前。 */
-// settings 必须有：设置页的 section 挂在它上面，漏了整块面板都不会出现（2026-10-21 踩的坑）
-export const inject = ['agents', 'tools', 'webServer', 'settings']
+// 只要最小集合：多声明一个不存在的服务 = 整个插件不装载（2026-10-21 踩过，连注入都跟着没了）
+export const inject = ['agents', 'tools', 'webServer']
 
 const DEFAULTS = {
   // 记忆目录；默认 ~/.dsh/memories
@@ -177,60 +177,86 @@ export function apply(ctx, config = {}) {
 
   const cfg = normalizeConfig(config)
   // 面板里改过的开关存在 .settings.json，优先级高于 cordis.patch.yml
-  const local = readLocalSettings(cfg.memoryDir)
-  if (typeof local.autoCapture === 'boolean') cfg.autoCapture = local.autoCapture
+  try {
+    const local = readLocalSettings(cfg.memoryDir)
+    if (typeof local.autoCapture === 'boolean') cfg.autoCapture = local.autoCapture
+  } catch {
+    /* 读不到就用默认，不该因此不装载 */
+  }
+
+  /**
+   * 每一块独立兜住。
+   * 教训（2026-10-21）：某一项注册失败（比如面板接口的参数不被接受）会让 apply 整个抛错，
+   * 结果连「记忆注入」都没了 —— 用户看到的现象是「插件整个失效」，很难联想到是面板的锅。
+   * 从今往后：任何一块挂了只记日志，其余照常工作。
+   *
+   * 日志同时写进 <memoryDir>/.errors.log —— DSH 桌面端没有可读的启动日志，
+   * 不落盘的话「哪个块失败了」永远查不到。
+   */
+  const guard = (name, fn) => {
+    try {
+      fn()
+    } catch (e) {
+      ctx.logger?.warn?.(`[${PLUGIN_NAME}] ${name} 初始化失败（其余功能继续）：${e?.message || e}`)
+      try {
+        mkdirSync(cfg.memoryDir, { recursive: true })
+        writeFileSync(
+          path.join(cfg.memoryDir, '.errors.log'),
+          `[${new Date().toISOString()}] ${name}: ${e?.stack || e}\n`,
+          { flag: 'a' },
+        )
+      } catch {
+        /* 落盘也失败就算了 */
+      }
+    }
+  }
+
+  // ── 第一块：注入。这是基本盘，必须先挂上 ──
   let warnedEmpty = false
+  guard('注入钩子', () => {
+    ctx.on(
+      'agent/pre-step',
+      async (event, next) => {
+        const decision = await next()
+        // 被拒的轮次不碰；中断的不碰
+        if (!decision || decision.kind === 'reject') return decision
+        if (event?.signal?.aborted) return decision
+        // 只处理第一步：一轮里后续步骤不该再挂钩子
+        const step = event?.step
+        if (step !== undefined && step !== 1) return decision
+        // 配了 turns 白名单就只在这些 turn 注入
+        const turn = event?.turn
+        if (cfg.turns.length > 0 && !cfg.turns.includes(turn)) return decision
+        // 已经在历史里就不重复注入
+        if (alreadyInjected(decision.messages)) return decision
 
-  ctx.on(
-    'agent/pre-step',
-    async (event, next) => {
-      const decision = await next()
-      // 被拒的轮次不碰；中断的不碰
-      if (!decision || decision.kind === 'reject') return decision
-      if (event?.signal?.aborted) return decision
-      // 只处理第一步：一轮里后续步骤不该再挂钩子
-      const step = event?.step
-      if (step !== undefined && step !== 1) return decision
-      // 配了 turns 白名单就只在这些 turn 注入
-      const turn = event?.turn
-      if (cfg.turns.length > 0 && !cfg.turns.includes(turn)) return decision
-      // 已经在历史里就不重复注入
-      if (alreadyInjected(decision.messages)) return decision
-
-      const text = buildBlock(cfg)
-      if (!text) {
-        if (!warnedEmpty) {
-          warnedEmpty = true
-          ctx.logger?.info?.(
-            `[${PLUGIN_NAME}] ${cfg.memoryDir} 下没有可注入的记忆文件，本次跳过`,
-          )
+        const text = buildBlock(cfg)
+        if (!text) {
+          if (!warnedEmpty) {
+            warnedEmpty = true
+            ctx.logger?.info?.(`[${PLUGIN_NAME}] ${cfg.memoryDir} 下没有可注入的记忆文件，本次跳过`)
+          }
+          return decision
         }
-        return decision
-      }
 
-      const message = await makeMemoryMessage(ctx, text)
-      return {
-        ...decision,
-        kind: 'enter',
-        messages: [...(decision.messages || []), message],
-      }
-    },
-    { prepend: true },
-  )
+        const message = await makeMemoryMessage(ctx, text)
+        return {
+          ...decision,
+          kind: 'enter',
+          messages: [...(decision.messages || []), message],
+        }
+      },
+      { prepend: true },
+    )
+  })
+
+  // ── 其余能力：任何一个挂了都不影响上面的注入 ──
+  guard('memory_search 工具', () => registerSearchTool(ctx, cfg))
+  guard('memory_remember 工具', () => registerWriteTool(ctx, cfg))
+  guard('自动回填', () => applyAutoCapture(ctx, cfg))
+  guard('面板接口', () => registerHttp(ctx, cfg))
 
   ctx.logger?.info?.(`[${PLUGIN_NAME}] 已装载，记忆目录 ${cfg.memoryDir}`)
-
-  // L2/L3：把「查过去」做成工具，模型能自己搜，不用等人喂
-  registerSearchTool(ctx, cfg)
-
-  // 写入：让模型能主动记（等价 Hermes 的 memory 工具）
-  registerWriteTool(ctx, cfg)
-
-  // 全自动：一轮结束后提炼事实写回文件
-  applyAutoCapture(ctx, cfg)
-
-  // 设置面板的接口
-  registerHttp(ctx, cfg)
 }
 
 // ─────────────────────────────────────────────────────────────────────
