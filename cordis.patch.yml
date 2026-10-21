@@ -1,0 +1,31 @@
+# dsh-memory-inject 的 bundle patch：把插件插进 profile 的插件树。
+#
+# 装法（二选一）：
+#   dsh plugin --profile desktop add dsh-memory-inject        # npm
+#   dsh plugin --profile desktop add D:\path\to\dsh-memory-inject   # 本地路径
+#
+# 装完之后可以在 profile 自己的 cordis.patch.yml 里用同一个 id 覆盖 config，
+# 例如换一个记忆目录、调大注入预算：
+#
+#   - id: memory-inject
+#     config:
+#       memoryDir: 'D:\my-memory'
+#       maxTotalChars: 6000
+
+- insert:
+    - id: memory-inject
+      name: 'dsh-memory-inject'
+      config:
+        # 记忆目录，默认 ~/.dsh/memories
+        # memoryDir: ''
+        # 注哪些文件（顺序即注入顺序）
+        # files:
+        #   - { name: 'USER.md',   heading: 'USER PROFILE (who the user is)' }
+        #   - { name: 'MEMORY.md', heading: 'MEMORY (your personal notes)' }
+        # 注入内容总预算（字符），超出的文件整份跳过
+        # maxTotalChars: 4000
+        # 只在这些 turn 上注入；留空 = 每轮检查（靠 source 标记去重）
+        # turns: []
+        # 是否带上「这是记忆不是新输入」的说明行
+        # includePreamble: true
+        {}
