@@ -34,13 +34,20 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 import os from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 
 import { readStore, writeStore, patchStore, batchStore, DELIM } from './lib/store.mjs'
 
 // Node 22.5+ 内置 sqlite；查记忆索引靠它，省掉一个 python 依赖。拿不到就只关掉检索能力。
+//
+// ⚠️ 这里必须是【同步】require，不能写 `await import(...)`。
+// 插件是按同步模块加载的：模块顶层出现 await 会被判定成异步模块，直接加载失败，
+// 连 apply() 都不会被调用 —— 现象是整个插件消失（注入没了、面板没了），
+// 而且不报任何可读错误。2026-10-21 就栽在这一行上。
 let DatabaseSync = null
 try {
-  ;({ DatabaseSync } = await import('node:sqlite'))
+  const requireSync = createRequire(import.meta.url)
+  ;({ DatabaseSync } = requireSync('node:sqlite'))
 } catch {
   DatabaseSync = null
 }
