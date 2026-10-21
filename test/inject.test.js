@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { apply } from '../index.js'
+import { apply, parseExtract } from '../index.js'
 
 const SOURCE_KIND = 'plugin:dsh-memory-inject'
 
@@ -134,4 +134,30 @@ test('被拒的轮次不注入', async () => {
   const decision = await handler({ step: 1, turn: 1 }, async () => ({ kind: 'reject' }))
   assert.strictEqual(decision.kind, 'reject')
   assert.strictEqual(decision.messages, undefined)
+})
+
+test('提炼解析：标准格式', () => {
+  const r = parseExtract('USER: 喜欢简洁的回复\nENV: 配置在 ~/.dsh')
+  assert.deepStrictEqual(r.user, ['喜欢简洁的回复'])
+  assert.deepStrictEqual(r.env, ['配置在 ~/.dsh'])
+})
+
+test('提炼解析：容忍 markdown 装饰（这是「0 条」的真凶）', () => {
+  const text = [
+    '好的，这是提炼结果：',
+    '- USER: 讨厌公文腔',
+    '**ENV:** 桌面端端口每次启动都变',
+    '1. USER：习惯把工作落盘',
+    '* `ENV`: 改配置前先备份',
+    '**NONE**',
+  ].join('\n')
+  const r = parseExtract(text)
+  assert.deepStrictEqual(r.user, ['讨厌公文腔', '习惯把工作落盘'])
+  assert.deepStrictEqual(r.env, ['桌面端端口每次启动都变', '改配置前先备份'])
+})
+
+test('提炼解析：NONE 与噪声行都跳过', () => {
+  const r = parseExtract('NONE\n\n说明文字\nUSER: 太短') // "太短" 只有 2 字，会被长度门槛挡掉
+  assert.deepStrictEqual(r.user, [])
+  assert.deepStrictEqual(r.env, [])
 })

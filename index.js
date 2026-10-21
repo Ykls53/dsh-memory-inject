@@ -787,12 +787,22 @@ function runHeadlessExtract(prompt, cfg) {
 }
 
 /** 把提炼结果解析成两类条目。 */
-function parseExtract(text) {
+export function parseExtract(text) {
   const user = []
   const env = []
   for (const raw of String(text || '').split(/\r?\n/)) {
-    const line = raw.trim()
-    if (!line || /^NONE$/i.test(line)) continue
+    // 先剥掉模型爱加的装饰再匹配。2026-10-21 修：原来只认行首直接是 USER:/ENV:，
+    // 于是 `- USER: …`、`**USER:** …`、`1. USER: …` 全被静默丢掉，
+    // 现象是「提炼完成：USER 0 条 / ENV 0 条」，但模型其实吐了东西。
+    const line = raw
+      .trim()
+      .replace(/^[>*•‣·\-–—]+\s*/, '') // 列表符 / 引用符
+      .replace(/^\d+[.、)]\s*/, '') // 编号
+      .replace(/\*\*/g, '') // 粗体标记
+      .replace(/`/g, '') // 行内代码
+      .replace(/^#+\s*/, '') // 标题井号
+      .trim()
+    if (!line || /^NONE\b/i.test(line)) continue
     const m = /^(USER|ENV)\s*[:：]\s*(.+)$/i.exec(line)
     if (!m) continue
     const item = m[2].trim()
@@ -1331,7 +1341,16 @@ function registerHttp(ctx, cfg) {
               }
               const parsed = parseExtract(text)
               persistExtract(ctx, cfg, parsed)
-              return sendJson(res, 200, { ok: true, ...parsed, state: statePayload(cfg) })
+              // raw = 模型原始回话（截断）。排查「提炼完成：0 条」用：
+              //   回 NONE        → 这一轮确实没新的可记事实，正常
+              //   回别的格式     → 解析器没认出来，是 prompt/解析对不上
+              //   回空/报错文字  → headless agent 或模型那边的问题
+              return sendJson(res, 200, {
+                ok: true,
+                ...parsed,
+                raw: String(text).slice(0, 2000),
+                state: statePayload(cfg),
+              })
             }
 
             // 备份清单 / 恢复

@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-inject",
-  "version": "0.3.9",
+  "version": "0.4.0",
   "description": "Inject USER.md / MEMORY.md as curated memory into DeepSeek Harness sessions — the 'always-on' half of a memory system, without any LLM call.",
   "type": "module",
   "main": "index.js",
