@@ -126,6 +126,22 @@ const DEFAULTS = {
   turns: [],
   // 注入时是否打这行说明；关掉只留正文
   includePreamble: true,
+  /**
+   * 跳过这些 agent preset 的会话（2026-10-22 加）。
+   *
+   * 为什么需要：QQ 机器人（`im-qqbot`）跟桌面端跑在**同一个进程**里，
+   * 而 `agent/pre-step` 是全局钩子 —— 不给过滤条件的话，主人自己的 USER.md / MEMORY.md
+   * 会被塞进 QQ 聊天里（对方是别人，不该看到这些）。
+   *
+   * 判据来自 `agent.session.header.agentPreset`：session 的 header 里存着这个会话用的 preset id。
+   * 但 pre-step 事件本身拿不到 agent —— 所以靠 `system-prompt/assemble`（同一 turn 里
+   * 先于 pre-step 触发，带 `context.agent`）把 preset 记下来，pre-step 再比对。
+   *
+   * 写成 `[]` 就恢复「所有会话都注入」的旧行为。
+   */
+  skipPresets: ['qqbot', 'qqbot-c2c'],
+  // 只在这些 preset 上注入；空数组 = 不限（跟 skipPresets 同时配时，白名单优先）
+  onlyPresets: [],
   // 全自动回填：一轮结束就提炼事实写回文件。用 DSH 当前模型，零配置。
   autoCapture: false,
   // 提炼子进程超时（毫秒）
@@ -145,6 +161,11 @@ function normalizeConfig(config = {}) {
   cfg.maxTotalChars = Number.isFinite(max) && max > 0 ? max : DEFAULTS.maxTotalChars
   cfg.turns = Array.isArray(cfg.turns) ? cfg.turns.filter((n) => Number.isInteger(n)) : []
   cfg.includePreamble = cfg.includePreamble !== false
+  // preset 白/黑名单：只留字符串，去重
+  const pick = (v) =>
+    Array.isArray(v) ? [...new Set(v.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.trim()))] : []
+  cfg.skipPresets = pick(cfg.skipPresets)
+  cfg.onlyPresets = pick(cfg.onlyPresets)
   return cfg
 }
 
@@ -287,6 +308,46 @@ export function apply(ctx, config = {}) {
 
   // ── 第一块：注入。这是基本盘，必须先挂上 ──
   let warnedEmpty = false
+
+  /**
+   * 记录「这一 turn 是哪个 preset 在跑」。
+   *
+   * 为什么要绕这一道：`agent/pre-step` 的事件里只有 messages/turn/step/signal，
+   * **没有 agent，也没有 session**（cordis 的 dispatch 没传 thisArg，监听器拿不到上下文）。
+   * 但 `system-prompt/assemble` 带 `context.agent`，而且它在同一个 turn 里**先于** pre-step 触发
+   * （见 dsh-agent-loop 的 preStep：先 await systemPrompt.assemble，再 dispatch agent/pre-step）。
+   * 所以在这儿把 preset 记下来，pre-step 紧接着读。
+   *
+   * 判据是 `agent.session.header.agentPreset` —— session header 里存着这个会话用的 preset id。
+   * 时间窗 200ms：两个事件紧邻触发，窗外的旧值一律不认，避免跨会话串台。
+   */
+  let lastPreset = { value: null, at: 0 }
+  guard('preset 探针', () => {
+    ctx.on('system-prompt/assemble', async (assembly, context, next) => {
+      try {
+        const preset = context?.agent?.session?.header?.agentPreset
+        lastPreset = { value: typeof preset === 'string' ? preset : null, at: Date.now() }
+      } catch {
+        /* 拿不到就当没这回事，不影响组装 */
+      }
+      return next()
+    })
+  })
+
+  /** 当前 turn 的 preset 是否该被排除。 */
+  const presetExcluded = () => {
+    if (cfg.onlyPresets.length === 0 && cfg.skipPresets.length === 0) return false
+    const fresh = Date.now() - lastPreset.at < 200
+    const preset = fresh ? lastPreset.value : null
+    // 白名单优先：配了 onlyPresets 就只在名单里注入
+    if (cfg.onlyPresets.length > 0) {
+      if (preset === null) return false // 读不出来就按原行为放行，宁可多注入也别误伤
+      return !cfg.onlyPresets.includes(preset)
+    }
+    if (preset === null) return false
+    return cfg.skipPresets.includes(preset)
+  }
+
   guard('注入钩子', () => {
     ctx.on(
       'agent/pre-step',
@@ -301,6 +362,8 @@ export function apply(ctx, config = {}) {
         // 配了 turns 白名单就只在这些 turn 注入
         const turn = event?.turn
         if (cfg.turns.length > 0 && !cfg.turns.includes(turn)) return decision
+        // 这个 preset 被排除了（比如 QQ 机器人）就不注入
+        if (presetExcluded()) return decision
         // 已经在历史里就不重复注入
         if (alreadyInjected(decision.messages)) return decision
 

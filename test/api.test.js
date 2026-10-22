@@ -373,3 +373,74 @@ test('未知路由返回 404 JSON', async () => {
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── preset 过滤（2026-10-22 加）──
+// QQ 机器人跟桌面端同一个进程，agent/pre-step 是全局钩子；
+// 不按 preset 排除的话，主人的私人画像会被塞进 QQ 聊天。
+// 判据走 system-prompt/assemble 的 context.agent.session.header.agentPreset。
+
+/** 模拟一个 turn：先 assemble（带 agent），紧接着 pre-step。 */
+async function turnWithPreset(ctx, preset) {
+  const assemble = ctx.handlers.get('system-prompt/assemble')
+  const preStep = ctx.handlers.get('agent/pre-step')
+  if (assemble) {
+    await assemble({}, { agent: { session: { header: { agentPreset: preset } } } }, () => ({ sections: [] }))
+  }
+  const decision = await preStep({ step: 1, turn: 1, messages: [] }, async () => ({
+    kind: 'enter',
+    messages: [],
+  }))
+  return (decision.messages || []).some((m) => m?.source?.kind === 'plugin:dsh-memory-inject')
+}
+
+test('preset 过滤：桌面端 preset 照常注入', async () => {
+  const dir = tmpMemory()
+  try {
+    const ctx = boot(dir)
+    assert.strictEqual(await turnWithPreset(ctx, 'dafayu'), true)
+    assert.strictEqual(await turnWithPreset(ctx, 'secretary'), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('preset 过滤：qqbot / qqbot-c2c 不注入', async () => {
+  const dir = tmpMemory()
+  try {
+    const ctx = boot(dir)
+    assert.strictEqual(await turnWithPreset(ctx, 'qqbot'), false)
+    assert.strictEqual(await turnWithPreset(ctx, 'qqbot-c2c'), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('preset 过滤：拿不到 preset 时放行（宁可多注入不误伤）', async () => {
+  const dir = tmpMemory()
+  try {
+    const ctx = boot(dir)
+    // 不触发 assemble，模拟老版本或异常路径
+    const preStep = ctx.handlers.get('agent/pre-step')
+    const decision = await preStep({ step: 1, turn: 1, messages: [] }, async () => ({
+      kind: 'enter',
+      messages: [],
+    }))
+    assert.strictEqual(
+      (decision.messages || []).some((m) => m?.source?.kind === 'plugin:dsh-memory-inject'),
+      true,
+    )
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('preset 过滤：skipPresets 配空数组就恢复全注入', async () => {
+  const dir = tmpMemory()
+  try {
+    const ctx = makeCtx()
+    apply(ctx, { memoryDir: dir, skipPresets: [] })
+    assert.strictEqual(await turnWithPreset(ctx, 'qqbot'), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

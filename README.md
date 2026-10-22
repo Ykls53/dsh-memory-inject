@@ -177,8 +177,45 @@ python scripts/dsh-memory-index.py search "关键词"      # 验证一下
 | `maxTotalChars` | 4000 | 单次注入的总预算，超出的文件整份跳过 |
 | `turns` | `[]` | 空 = 每轮检查去重；填 `[1]` = 只第一轮 |
 | `includePreamble` | `true` | 是否带「这是记忆不是新输入」的说明行 |
+| `skipPresets` | `['qqbot', 'qqbot-c2c']` | **这些 preset 的会话不注入**（见下） |
+| `onlyPresets` | `[]` | 只在这些 preset 上注入；空 = 不限。配了就优先于 `skipPresets` |
 | `autoCapture` | `false` | 全自动回填开关 |
 | `captureTimeoutMs` | 180000 | 提炼子进程超时 |
+
+### 为什么默认排除 qqbot
+
+DSH 的插件挂在**进程**上，不是挂在某个会话上。QQ 机器人（`im-qqbot`）跟桌面端跑在同一个进程里，
+而 `agent/pre-step` 是**全局钩子**——不给过滤条件的话，你自己的 `USER.md` / `MEMORY.md`
+会被塞进每一段 QQ 聊天里，对面的人不该看到你的私人画像。
+
+判据是 `agent.session.header.agentPreset`（session 的 header 里存着这个会话用的 preset id）。
+
+但 `agent/pre-step` 的事件里**只有 messages/turn/step/signal，没有 agent 也没有 session**
+（cordis 的 `dispatch` 没传 `thisArg`，监听器拿不到上下文）。所以走了一条曲线：
+
+```
+system-prompt/assemble   ← 这里带 context.agent，能读到 agentPreset
+        ↓ （同一个 turn，紧邻触发）
+agent/pre-step           ← 记下的 preset 在这里比对，命中 skipPresets 就直接返回
+```
+
+时间窗 200ms：两个事件之间只隔一个 await，窗外的旧值不认，避免多会话串台。
+
+改法：
+
+```yaml
+# 恢复「所有会话都注入」
+- id: memory-inject
+  config:
+    skipPresets: []
+
+# 反过来：只让指定的 preset 用记忆
+- id: memory-inject
+  config:
+    onlyPresets: ['dafayu']
+```
+
+**拿不到 preset 时放行** —— 宁可多注入，也不因为读不出标识就把记忆整个关掉。
 
 ## 设计上的取舍（说清楚，别踩）
 
