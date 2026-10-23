@@ -296,6 +296,30 @@ child.stdin.end(prompt, 'utf8')   // prompt 不进命令行，换行随便
 （试过并不可行的：直接 spawn `DeepSeek Harness.exe` + `cli.js` 绕开 shell —— 完全没输出；
 让模型读临时文件 —— headless profile 里没有 `tool-fs`；把换行换成空格 —— body 上限 6000 会顶到 cmd 的 8191。）
 
+**7. 开发时别拿主 profile 当试验台 —— 用 headless / web profile 做沙盒。**
+插件代码装进 profile 的 `node_modules` 之后，**改文件不会热重载**，必须重启客户端才生效。
+但重启是有代价的（见下），而且如果你正跑在宿主进程里，重启等于把调试会话也一起杀掉。
+
+DSH 桌面端每次启动都会给 `127.0.0.1` 写一条登录 cookie，名字形如
+`dsh-auth-<sha256("127.0.0.1:随机端口")>`、有效期 400 天。**名字带随机端口 ⇒ 旧 cookie 永不覆盖、每次启动永久多一条**
+（约 223 字节）。攒到约 70 条（≈15.8KB）就撑爆宿主 16KB 请求头上限，宿主回 `431`，
+外壳报 `desktop welcome: Web authentication failed` —— **桌面端直接打不开**。
+（这是 DSH 自身的设计缺陷，不是你插件的锅，但反复重启会亲手把它攒到爆点。）
+
+所以分层验证，把主 profile 留到最后一次：
+
+| 层 | 能验什么 | 怎么做 |
+|---|---|---|
+| ① 离线 | 单测、端到端、cordis 事件模拟 | `node --test test/*.test.js`；`new Context()` 后 `root.plugin(mod)`，手工 `waterfall('agent/pre-step', …)` |
+| ② headless 沙盒 | 真 DSH 加载、`apply` 被调用、钩子注册、工具注册、**子进程链路** | 装进 headless profile，`dsh --profile headless "测试"` |
+| ③ web 沙盒 | 要 `webServer` 的面板 HTTP 接口 | 装进 web profile，起网页端（`127.0.0.1:3080`） |
+| ④ 主 profile | 只为最终生效 | `dsh plugin --profile <主> add <tgz>` + **一次**重启 |
+
+②③ 用的是独立进程或独立 profile，完全不碰你正在用的客户端。
+实测 ② 能一路验到「自动回填 → 解析出 N 条 → raw 内容」，覆盖了本插件绝大多数故障面。
+
+⇒ 攒一批改动一次重启；重启前先把当前进展写进交接文件，别让会话断了丢线索。
+
 ## 测试
 
 ```bash
