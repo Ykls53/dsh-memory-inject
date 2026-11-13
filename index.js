@@ -431,6 +431,18 @@ export function apply(ctx, config = {}) {
    */
   let lastPreset = { value: null, at: 0 }
   let lastSession = { value: null, at: 0 }
+  /**
+   * 最近一次 assemble 见到的 agent 对象（2026-11-14 加）。
+   *
+   * 为什么需要：`agent/pre-step` 的事件里**没有 agent**（只有 messages/turn/step/signal），
+   * 所以 event.agent 永远是 undefined，`injectedFingerprintInSession` 永远返回 null，
+   * 只能靠 sessionId 缓存兜底。而 sessionId 原来只在 200ms 窗内认，
+   * 一旦 pre-step 跟 assemble 隔得久一点就取不到 → 每轮都注入。
+   *
+   * 修法：assemble 里把 agent 也存下来，pre-step 时用「最新那个 agent」去查会话历史。
+   * agent 对象本身带 session，查到的历史就是这个会话的真实历史，比缓存可靠。
+   */
+  let lastAgent = { value: null, at: 0 }
   // 会话级指纹缓存：sessionId → 已注入的指纹。同一会话内指纹没变就不注入，
   // 根治「每轮都注入」（pre-step 的 messages 只含本轮认领消息，不含历史，
   // 所以不能靠查决策消息里的旧基线来判断，必须自己记）。
@@ -438,11 +450,13 @@ export function apply(ctx, config = {}) {
   guard('preset 探针', () => {
     ctx.on('system-prompt/assemble', async (assembly, context, next) => {
       try {
-        const header = context?.agent?.session?.header
+        const agent = context?.agent
+        const header = agent?.session?.header
         const preset = header?.agentPreset
         const sid = header?.id
         lastPreset = { value: typeof preset === 'string' ? preset : null, at: Date.now() }
         lastSession = { value: typeof sid === 'string' ? sid : null, at: Date.now() }
+        if (agent?.session) lastAgent = { value: agent, at: Date.now() }
       } catch {
         /* 拿不到就当没这回事，不影响组装 */
       }
@@ -464,8 +478,14 @@ export function apply(ctx, config = {}) {
     return cfg.skipPresets.includes(preset)
   }
 
-  /** 当前 turn 的 sessionId（跟 preset 同一个 200ms 窗口从 system-prompt/assemble 拿）。 */
-  const freshSessionId = () => (Date.now() - lastSession.at < 200 ? lastSession.value : null)
+  /**
+   * 当前会话的 sessionId。
+   * 2026-11-14 改：原来只认 200ms 内的新鲜值，pre-step 稍晚一点就取不到 → 每轮重复注入。
+   * 改成「优先新鲜值、拿不到就用最近一次见过的」。
+   * sessionId 只用于区分「是不是同一个会话」，退回旧值最多让判断偏一次，
+   * 比每轮都注入的代价小得多。preset 那边仍保留严格 200ms 窗口（它直接影响注不注入）。
+   */
+  const freshSessionId = () => lastSession.value || null
 
   guard('注入钩子', () => {
     ctx.on(
@@ -499,14 +519,18 @@ export function apply(ctx, config = {}) {
         //   历史里已有同指纹 → 不注入（不重复堆）；历史里没有（首次/被压缩）→ 补注入；
         //   指纹变了（内容改了）→ 注入新基线（最新内容在场）。
         const fingerprint = hashText(text)
-        const hasAgent = !!event?.agent?.session?.surface
-        const histFp = injectedFingerprintInSession(event?.agent)
-        const sid = freshSessionId()
-        if (hasAgent) {
-          // 有 agent 就以会话历史为准：历史里没有（首次/压缩后）或指纹不同 → 注入
-          if (histFp !== null && histFp === fingerprint) return decision
+        // agent 从两个地方取：事件自带（新宿主）或 assemble 里缓存的（老宿主没有 event.agent）
+        const agent = event?.agent?.session?.surface ? event.agent : (Date.now() - lastAgent.at < 60000 ? lastAgent.value : null)
+        const histFp = injectedFingerprintInSession(agent)
+        const sid = freshSessionId() || (agent?.session?.header?.id ?? null)
+        if (histFp !== null) {
+          // 能查到会话历史就以它为准：同指纹不注入，变了/被压缩了就注入
+          if (histFp === fingerprint) {
+            if (sid) injectedFps.set(sid, fingerprint)
+            return decision
+          }
         } else if (sid && injectedFps.get(sid) === fingerprint) {
-          // 拿不到 agent 时，才用会话级缓存兜底
+          // 查不到历史（旧宿主/首次）才用会话级缓存兜底
           return decision
         }
         if (sid) injectedFps.set(sid, fingerprint)
