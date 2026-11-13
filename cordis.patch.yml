@@ -33,4 +33,7 @@
         # autoCapture: true
         # 提炼子进程超时（毫秒）
         # captureTimeoutMs: 180000
+        # 做梦通道：跨会话离线整理已有记忆（默认走提炼通道的模型）
+        # dreamModelProvider: 'opencode-go'   # 'opencode-go' | 'headless' | 留空（先 HTTP 再回退）
+        # dreamModelName: ''                  # 留空 = 跟提炼通道同一个模型；填了就覆盖
         {}

@@ -13,3 +13,9 @@ Thumbs.db
 *.db-shm
 *.db-wal
 
+# 运行时统计（注入次数/访问频率），不进仓库
+.usage.json
+.rejected.json
+.evicted.json
+.settings.json
+

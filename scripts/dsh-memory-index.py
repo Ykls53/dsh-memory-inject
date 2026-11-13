@@ -30,6 +30,40 @@ HOME = os.path.expanduser('~')
 DUMP = os.path.join(HOME, '.dsh', 'memories', 'dump.jsonl')
 DB = os.path.join(HOME, '.dsh', 'memories', 'index.db')
 
+# ── 不该进记忆库的会话（2026-11-14 加）────────────────────
+# 记忆库是「主人自己的对话历史」，不是宿主里跑过的一切。
+# QQ 机器人、B站值守、以及插件自己的调试会话都是机器语境，
+# 混进来会污染检索、也会被提炼层当成主人的事实。三类一律排除：
+#   1) QQ 机器人（cwd 在 qqbot，或 preset 是 qqbot*）
+#   2) B站值守（bili-duty / bili-duty-workspace）
+#   3) 插件自身的目录与临时测试目录（memories 自己、mem-guard-*、mem-sandbox-*）
+#
+# 匹配方式：把 project / cwd 都转成「小写 + 正斜杠」后做子串匹配，
+# 这样 Windows 的反斜杠、盘符大小写都不会漏。
+EXCLUDE_PATTERNS = [
+    'qqbot',
+    'bili-duty',
+    '.dsh/memories',
+    'mem-guard-',
+    'mem-sandbox-',
+    '/temp/mem-',
+]
+
+# preset 层面的排除：这些 preset 的会话是机器语境，不是主人对话
+EXCLUDE_PRESETS = {'qqbot', 'qqbot-c2c', 'bili-duty'}
+
+
+def norm(s):
+    return str(s or '').lower().replace('\\', '/')
+
+
+def is_excluded(project='', cwd='', preset=''):
+    """这个会话该不该排除在记忆库外。"""
+    if preset and str(preset).strip().lower() in EXCLUDE_PRESETS:
+        return True
+    hay = norm(project) + ' | ' + norm(cwd)
+    return any(pat in hay for pat in EXCLUDE_PATTERNS)
+
 
 def connect(db_path=DB, readonly=False):
     if readonly:
@@ -97,6 +131,18 @@ def cmd_build(args):
             elif t == 'msg':
                 msgs.append(o)
 
+    # 先按规则剔掉不该进记忆库的会话（QQ 机器人 / B站值守 / 插件自身与临时测试）
+    excluded = {}
+    kept_sessions = {}
+    for sid, meta in sessions.items():
+        if is_excluded(meta.get('project'), meta.get('cwd'), meta.get('preset')):
+            excluded[sid] = meta
+        else:
+            kept_sessions[sid] = meta
+    # 被剔会话的消息和标题一起丢掉，别留下孤儿 chunk
+    msgs = [m for m in msgs if m.get('session') in kept_sessions]
+    titles = {k: v for k, v in titles.items() if k in kept_sessions}
+
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     conn = connect()
     conn.executescript(SCHEMA)
@@ -115,7 +161,7 @@ def cmd_build(args):
             a['last_reply'] = m['text']
 
     rows_s, rows_c = [], []
-    for sid, meta in sessions.items():
+    for sid, meta in kept_sessions.items():
         a = agg.get(sid, {})
         rows_s.append((
             sid, meta.get('project'), meta.get('cwd'), meta.get('preset'),
@@ -147,6 +193,15 @@ def cmd_build(args):
     n_titles = conn.execute('SELECT count(*) FROM chunks WHERE kind="title"').fetchone()[0]
     print(f'[build] 库 {DB}')
     print(f'[build] 会话 {len(rows_s)} 个｜消息 {n_msgs} 条｜标题 {n_titles} 条')
+    if excluded:
+        # 按 project 汇总，让人一眼看出剔掉了哪些（QQ 机器人 / B站值守 / 临时测试）
+        by_proj = {}
+        for meta in excluded.values():
+            key = meta.get('project') or '(未知)'
+            by_proj[key] = by_proj.get(key, 0) + 1
+        print(f'[build] 已排除 {len(excluded)} 个会话（不入记忆库）：')
+        for proj, n in sorted(by_proj.items(), key=lambda kv: -kv[1]):
+            print(f'          {n:4d}  {proj}')
     conn.close()
     return 0
 

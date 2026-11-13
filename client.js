@@ -32,6 +32,9 @@ window.__ModuleLoader__.load({
      */
     const NEEDED_ROUTES = [
       'capture',
+      'dream',
+      'models',
+      'pin',
       'backups',
       'restore',
       'session',
@@ -121,7 +124,7 @@ window.__ModuleLoader__.load({
     }
 
     // ── 一份记忆文件 ────────────────────────────────────
-    function FileCard({ file, entries, onChange, onSave, onLimit, onRefresh, busy }) {
+    function FileCard({ file, entries, onChange, onSave, onLimit, onRefresh, onPin, busy }) {
       const [newText, setNewText] = useState('')
       const [limitDraft, setLimitDraft] = useState(String(file.maxChars))
       const [showHistory, setShowHistory] = useState(false)
@@ -180,10 +183,22 @@ window.__ModuleLoader__.load({
 
         entries.length === 0
           ? h('div', { style: { ...muted, marginBottom: 10 } }, '还没有条目。下面输入框加第一条。')
-          : entries.map((text, i) =>
-              h(
+          : entries.map((text, i) => {
+              // 锁定的条目：预算满了也不会被自动顶掉（.pinned.json）
+              const locked = (file.pinned || []).includes(text)
+              return h(
                 'div',
-                { key: i, style: { display: 'flex', gap: 8, marginBottom: 8, alignItems: 'flex-start' } },
+                {
+                  key: i,
+                  style: {
+                    display: 'flex',
+                    gap: 8,
+                    marginBottom: 8,
+                    alignItems: 'flex-start',
+                    borderLeft: locked ? '3px solid #d1a343' : '3px solid transparent',
+                    paddingLeft: locked ? 6 : 0,
+                  },
+                },
                 h('textarea', {
                   value: text,
                   rows: Math.min(6, Math.max(2, Math.ceil(text.length / 46))),
@@ -194,9 +209,18 @@ window.__ModuleLoader__.load({
                   },
                   style: { ...input, resize: 'vertical', lineHeight: 1.5 },
                 }),
+                h(
+                  'button',
+                  {
+                    style: locked ? { ...btn, color: '#d1a343', borderColor: 'rgba(209,163,67,.5)' } : btn,
+                    title: locked ? '已锁定：预算满了也不会被自动顶掉，点击解锁' : '锁定这一条（自动腾位时不许动它）',
+                    onClick: () => onPin(text, !locked),
+                  },
+                  locked ? '🔒' : '🔓',
+                ),
                 h('button', { style: btnDanger, onClick: () => onChange(entries.filter((_, j) => j !== i)) }, '删'),
-              ),
-            ),
+              )
+            }),
 
         similar.length > 0
           ? h(
@@ -242,6 +266,67 @@ window.__ModuleLoader__.load({
         ),
 
         showHistory ? h(BackupPanel, { file: file.name, onRestored: onRefresh }) : null,
+      )
+    }
+
+    // ── 记忆地图页（表征层 wiki）─────────────
+    /**
+     * wiki 是「记忆地图」：按主题聚合的页面，比记忆条目更适合看全景。
+     * 它**不进注入区**（文章警告顶层必须小），模型要用时通过 memory_wiki 工具取。
+     * 这一页只是给人看：有哪些主题、每页写了什么。
+     */
+    function WikiTab() {
+      const [topics, setTopics] = useState(null)
+      const [open, setOpen] = useState(null) // { topic, content }
+      const [msg, setMsg] = useState('')
+
+      useEffect(() => {
+        getJson('/wiki')
+          .then((r) => {
+            if (r && r.ok) setTopics(r.topics || [])
+            else setMsg((r && r.error) || '读取失败')
+          })
+          .catch((e) => setMsg('读取失败：' + e.message))
+      }, [])
+
+      const openTopic = async (t) => {
+        if (open && open.topic === t) return setOpen(null)
+        const r = await getJson('/wiki?topic=' + encodeURIComponent(t))
+        if (r && r.ok) setOpen({ topic: t, content: r.content })
+        else setMsg((r && r.error) || '打开失败')
+      }
+
+      if (!topics) return h('div', { style: { ...muted, padding: 12 } }, msg || '读取中…')
+      if (topics.length === 0) {
+        return h('div', { style: { ...card, padding: 12 } },
+          h('strong', null, '还没有记忆地图'),
+          h('div', { style: { ...muted, marginTop: 6 } },
+            '跑一轮「做梦整理」会自动把相关条目归拢成主题页（比如「PS5 开发」「记忆插件」）。'),
+        )
+      }
+
+      return h('div', null,
+        h('div', { style: { ...muted, marginBottom: 10 } },
+          `${topics.length} 个主题。主题页不进注入区（省 token），模型需要时会自己用 memory_wiki 取。`),
+        ...topics.map((t) =>
+          h('div', { key: t.topic, style: { ...card, padding: 10, marginBottom: 8 } },
+            h('div', {
+              style: { cursor: 'pointer', fontWeight: 600 },
+              onClick: () => openTopic(t.topic),
+            }, (open && open.topic === t.topic ? '▾ ' : '▸ ') + t.topic),
+            t.summary ? h('div', { style: { ...muted, marginTop: 3 } }, t.summary) : null,
+            open && open.topic === t.topic
+              ? h('pre', {
+                  style: {
+                    marginTop: 8, padding: 8, background: 'rgba(128,128,128,.08)',
+                    borderRadius: 6, fontSize: 12, whiteSpace: 'pre-wrap',
+                    maxHeight: 320, overflow: 'auto', fontFamily: 'inherit',
+                  },
+                }, open.content)
+              : null,
+          ),
+        ),
+        msg ? h('div', { style: { ...muted, marginTop: 6 } }, msg) : null,
       )
     }
 
@@ -372,9 +457,12 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = useState({})
       const [msg, setMsg] = useState('')
       const [busy, setBusy] = useState(false)
+      const [models, setModels] = useState({ extractProvider: '', extractModel: '', dreamModelProvider: '', dreamModelName: '', providers: null })
+      // 模型选择默认收起：面板顶部只留一行摘要，点「模型 ⚙」才展开
+      const [showModelCfg, setShowModelCfg] = useState(false)
 
       const load = useCallback(async () => {
-        const st = await getJson('/state')
+        const [st, mp] = await Promise.all([getJson('/state'), getJson('/models').catch(() => null)])
         if (!st || st.ok === false) {
           setMsg('加载失败：' + (st && st.error ? st.error : '接口没响应'))
           return
@@ -383,6 +471,13 @@ window.__ModuleLoader__.load({
         const d = {}
         for (const f of st.files || []) d[f.name] = [...(f.entries || [])]
         setDraft(d)
+        setModels({
+          extractProvider: st.extractProvider || '',
+          extractModel: st.extractModel || '',
+          dreamModelProvider: st.dreamModelProvider || '',
+          dreamModelName: st.dreamModelName || '',
+          providers: (mp && mp.ok ? mp.providers : []) || [],
+        })
       }, [])
 
       useEffect(() => {
@@ -413,6 +508,25 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /** 保存手动选的模型（提炼 + 做梦），存 .settings.json 并立刻生效。 */
+      const saveModels = async () => {
+        setBusy(true)
+        try {
+          const r = await post('/config', {
+            extractProvider: models.extractProvider,
+            extractModel: models.extractModel,
+            dreamModelProvider: models.dreamModelProvider,
+            dreamModelName: models.dreamModelName,
+          })
+          if (r.ok) {
+            if (r.state) setData(r.state)
+            setMsg('模型选择已保存并生效')
+          } else setMsg('保存模型失败：' + (r.error || ''))
+        } finally {
+          setBusy(false)
+        }
+      }
+
       const save = async (fileName) => {
         setBusy(true)
         try {
@@ -432,14 +546,55 @@ window.__ModuleLoader__.load({
 
       const captureNow = async () => {
         setBusy(true)
-        setMsg('提炼最近一轮…')
+        // 说清要抓哪一份：抓的是 cwd，不是「最后说话的那个会话」（可能是 QQ 机器人）
+        const target = data.capturableSession?.cwd
+        setMsg(target ? `提炼最近一轮（${target}）…` : '提炼最近一轮…')
         try {
           const r = await post('/capture', {})
           if (r.ok) {
             if (r.state) setData(r.state)
-            setMsg(`提炼完成：USER ${r.user.length} 条 / ENV ${r.env.length} 条`)
+            const from = r.capturedFrom?.cwd ? `（来源 ${r.capturedFrom.cwd}）` : ''
+            setMsg(`提炼完成：USER ${r.user.length} 条 / ENV ${r.env.length} 条${from}`)
             await load()
           } else setMsg('提炼失败：' + (r.error || ''))
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      /** 做梦：无感执行——只做增量，没被提到的条目原样保留，不需要主人确认。 */
+      const dreamNow = async () => {
+        setBusy(true)
+        setMsg('做梦整理中…')
+        try {
+          const r = await post('/dream?dry=0', {})
+          if (!r.ok) {
+            setMsg('做梦失败：' + (r.error || ''))
+            return
+          }
+          if (r.state) setData(r.state)
+          await load()
+          if (!r.changed) {
+            setMsg(r.note || '做梦完成：没有需要改的')
+          } else {
+            const sk = (r.skipped || []).length ? `（拦下 ${r.skipped.length} 处：${r.skipped[0]}）` : ''
+            setMsg(`做梦完成：${(r.applied || []).join('；')}${sk}`)
+          }
+        } finally {
+          setBusy(false)
+        }
+      }
+
+      /** 锁定 / 解锁一条：锁住的条目在预算满时不会被自动顶掉。 */
+      const togglePin = async (fileName, text, pinned) => {
+        setBusy(true)
+        try {
+          const r = await post('/pin', { file: fileName, text, pinned })
+          if (r.ok) {
+            if (r.state) setData(r.state)
+            setMsg(`${pinned ? '已锁定' : '已解锁'}：${String(text).slice(0, 30)}`)
+            await load()
+          } else setMsg('锁定失败：' + (r.error || ''))
         } finally {
           setBusy(false)
         }
@@ -514,6 +669,31 @@ window.__ModuleLoader__.load({
             )
           : null
 
+      // 按 provider 分组（照刷B站插件的 optgroup 做法）：
+      // 平铺二三十项 + 每项带完整 provider 名 = 一坨，分组后一眼就找到。
+      const modelGroups = (models.providers || [])
+        .map((p) => ({
+          id: p.id,
+          label: p.name && p.name !== p.id ? p.name : p.id,
+          models: (p.models || []).map((m) => ({
+            key: p.id + '|' + m.id,
+            // 组里已经有 provider 名了，选项只留型号，不再重复
+            label: m.id,
+            hint: m.name && m.name !== m.id ? m.name : '',
+          })),
+        }))
+        .filter((g) => g.models.length > 0)
+      const modelOpts = []
+      for (const g of modelGroups) for (const m of g.models) modelOpts.push(m)
+      const extractValue = (() => {
+        if (!models.extractModel) return ''
+        const hit = modelOpts.find((o) => o.key.endsWith('|' + models.extractModel))
+        return hit ? hit.key : 'cur|' + models.extractModel
+      })()
+      const dreamValue = models.dreamModelProvider && models.dreamModelName
+        ? models.dreamModelProvider + '|' + models.dreamModelName
+        : ''
+
       return h(
         'div',
         { style: { padding: '4px 2px', fontSize: 13 } },
@@ -522,9 +702,10 @@ window.__ModuleLoader__.load({
 
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 } },
           tabBtn('memory', '常驻记忆'),
+          tabBtn('wiki', '记忆地图'),
           tabBtn('sessions', '会话摘要'),
           h('span', { style: { ...muted, marginLeft: 'auto' } },
-            tab === 'memory' ? '第 1 层' : '第 2 / 3 层'),
+            tab === 'memory' ? '第 1 层' : (tab === 'wiki' ? '表征层' : '第 2 / 3 层')),
           h('span', { style: muted }, data.version ? `v${data.version}` : ''),
         ),
 
@@ -532,25 +713,107 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               null,
+              // ── 工具条：状态 + 所有操作都收在这一行里，不再往下堆卡片 ──
               h(
                 'div',
-                { style: { ...card, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' } },
-                h(
-                  'div',
-                  { style: { minWidth: 260, flex: 1 } },
-                  h('strong', null, '自动总结'),
-                  h('div', { style: { ...muted, marginTop: 4 } },
-                    `开着：每轮结束自动提炼事实写回下面两份文件。模型跟随 DSH 当前选择 —— ${data.modelNote || ''}`),
-                ),
-                h('div', { style: { display: 'flex', gap: 8 } },
-                  h('button', { style: btn, disabled: busy, onClick: captureNow }, '现在提炼最近一轮'),
+                { style: { ...card, marginBottom: 10, padding: 10 } },
+                h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
                   h('button', {
                     style: data.autoCapture ? btnPrimary : btn,
                     disabled: busy,
                     onClick: () => toggleAuto(!data.autoCapture),
-                  }, data.autoCapture ? '已开 · 点击关闭' : '已关 · 点击开启'),
+                    title: '开着一轮结束就自动提炼事实写回',
+                  }, data.autoCapture ? '自动总结 · 开' : '自动总结 · 关'),
+                  h('button', { style: btn, disabled: busy, onClick: captureNow }, '提炼一轮'),
+                  h('button', { style: btn, disabled: busy, onClick: dreamNow }, '做梦整理'),
+                  h('div', { style: { flex: 1 } }),
+                  h('button', {
+                    style: showModelCfg ? { ...btn, background: 'rgba(47,111,237,.12)' } : btn,
+                    onClick: () => setShowModelCfg(!showModelCfg),
+                  }, '模型 ⚙'),
                 ),
+                // 一行摘要：现在用的是谁，一眼看见，不用展开、不用往下滚
+                h('div', { style: { ...muted, marginTop: 6 } },
+                  `提炼 ${models.extractModel || '默认'}　·　做梦 ${models.dreamModelName || '跟提炼'}`),
+                h('div', { style: { ...muted, marginTop: 2 } },
+                  data.capturableSession
+                    ? `「提炼一轮」会抓：${data.capturableSession.cwd || '(未知目录)'}`
+                    : '「提炼一轮」暂时没抓到可提炼的会话 —— 先在你自己的对话里发一条'),
               ),
+
+              // 模型选择：默认收起，点「模型 ⚙」才展开，不占视线
+              showModelCfg
+                ? h(
+                    'div',
+                    { style: { ...card, marginBottom: 10, padding: 10 } },
+                    h('div', { style: { ...muted, marginBottom: 6 } },
+                      '从当前客户端可用模型里点选，改完点保存立刻生效。'),
+                    h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 } },
+                      h('span', { style: { width: 64, flex: 'none' } }, '提炼'),
+                      h('select', {
+                        style: { ...input, flex: 1, minWidth: 0 },
+                        value: extractValue,
+                        onChange: (e) => {
+                          const v = e.target.value
+                          const i = v.indexOf('|')
+                          setModels({
+                            ...models,
+                            extractProvider: i > 0 ? v.slice(0, i) : '',
+                            extractModel: i >= 0 ? v.slice(i + 1) : v,
+                          })
+                        },
+                      },
+                        h('option', { value: '' }, '默认'),
+                        extractValue.startsWith('cur|')
+                          ? h('option', { value: extractValue }, extractValue.slice(4) + '（当前）') : null,
+                        ...modelGroups.map((g) =>
+                          h('optgroup', { key: 'eg-' + g.id, label: g.label },
+                            ...g.models.map((m) => h('option', { key: m.key, value: m.key }, m.label)))),
+                      ),
+                    ),
+                    h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8 } },
+                      h('span', { style: { width: 64, flex: 'none' } }, '做梦'),
+                      h('select', {
+                        style: { ...input, flex: 1, minWidth: 0 },
+                        value: dreamValue,
+                        onChange: (e) => {
+                          const v = e.target.value
+                          const i = v.indexOf('|')
+                          setModels({
+                            ...models,
+                            dreamModelProvider: i > 0 ? v.slice(0, i) : '',
+                            dreamModelName: i > 0 ? v.slice(i + 1) : '',
+                          })
+                        },
+                      },
+                        h('option', { value: '' }, '跟提炼同一个'),
+                        dreamValue && !modelOpts.some((o) => o.key === dreamValue)
+                          ? h('option', { value: dreamValue }, dreamValue.replace('|', ' / ') + '（当前）') : null,
+                        ...modelGroups.map((g) =>
+                          h('optgroup', { key: 'dg-' + g.id, label: g.label },
+                            ...g.models.map((m) => h('option', { key: 'd-' + m.key, value: m.key }, m.label)))),
+                      ),
+                    ),
+                    models.providers === null
+                      ? h('div', { style: muted }, '模型列表读取中…')
+                      : (models.providers.length === 0
+                        ? h('div', { style: muted }, '宿主没列出可用模型 —— 可先用默认。') : null),
+                    h('button', { style: btnPrimary, disabled: busy, onClick: saveModels }, '保存'),
+                  )
+                : null,
+
+              // 预算满了自动顶掉的是哪些（锁定的不动）；没有就不显示
+              (data.evictedRecent || []).length > 0
+                ? h('div', { style: { ...card, marginBottom: 10, borderColor: 'rgba(209,163,67,.45)' } },
+                    h('strong', null, '最近自动顶掉的条目'),
+                    h('div', { style: { ...muted, marginTop: 4, marginBottom: 6 } },
+                      '预算到顶时才会动；锁🔒的条目不会被顶。要恢复就照着下面原文加回去。'),
+                    ...(data.evictedRecent || []).slice(-5).map((e, i) =>
+                      h('div', { key: i, style: { ...muted, marginTop: 2 } },
+                        `· [${e.file || '?'}] ${String(e.text || '').slice(0, 60)}　—　${e.reason || ''}`),
+                    ),
+                  )
+                : null,
 
               ...(data.files || []).map((f) =>
                 h(FileCard, {
@@ -562,6 +825,7 @@ window.__ModuleLoader__.load({
                   onSave: () => save(f.name),
                   onLimit: (n) => setLimit(f.name, n),
                   onRefresh: load,
+                  onPin: (text, pinned) => togglePin(f.name, text, pinned),
                 }),
               ),
 
@@ -572,7 +836,7 @@ window.__ModuleLoader__.load({
               h('div', { style: { ...muted, marginTop: 4 } },
                 msg || `记忆目录：${data.memoryDir || ''}　·　上限自己定，改完立刻生效`),
             )
-          : h(SessionsTab),
+          : (tab === 'wiki' ? h(WikiTab) : h(SessionsTab)),
       )
     }
 

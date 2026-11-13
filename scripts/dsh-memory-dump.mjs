@@ -35,6 +35,18 @@ let onlyProject = null;
 let incremental = false;
 const MAX_TEXT = 4000;   // 单条正文上限，防工具输出/长文把库灌爆
 
+// ── 不该进记忆库的会话（2026-11-14 加，与 dsh-memory-index.py 的规则保持一致）──
+// 记忆库要的是「主人自己的对话历史」，不是宿主里跑过的一切：
+//   QQ 机器人、B站值守、插件自身目录、临时测试会话都是机器语境，一律不导。
+const EXCLUDE_PATTERNS = ['qqbot', 'bili-duty', '.dsh/memories', 'mem-guard-', 'mem-sandbox-', '/temp/mem-'];
+const EXCLUDE_PRESETS = new Set(['qqbot', 'qqbot-c2c', 'bili-duty']);
+const norm = (s) => String(s || '').toLowerCase().replace(/\\/g, '/');
+function isExcluded(project, cwd, preset) {
+  if (preset && EXCLUDE_PRESETS.has(String(preset).trim().toLowerCase())) return true;
+  const hay = norm(project) + ' | ' + norm(cwd);
+  return EXCLUDE_PATTERNS.some((p) => hay.includes(p));
+}
+
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--root') root = argv[++i];
@@ -114,7 +126,7 @@ const projects = readdirSync(root, { withFileTypes: true })
   .filter(d => !onlyProject || d.name === onlyProject);
 
 const out = [];
-let nSessions = 0, nMsgs = 0, nSkipped = 0, nFail = 0;
+let nSessions = 0, nMsgs = 0, nSkipped = 0, nFail = 0, nExcluded = 0;
 
 for (const proj of projects) {
   const projDir = path.join(root, proj.name);
@@ -169,6 +181,11 @@ for (const proj of projects) {
     }
 
     const sid = header?.id || sd.name.replace(/^session-/, '');
+    // 排除 QQ 机器人 / B站值守 / 插件自身与临时测试会话（机器语境，不进记忆库）
+    if (isExcluded(proj.name, header?.cwd, header?.preset)) {
+      nExcluded++;
+      continue;
+    }
     out.push(JSON.stringify({
       t: 'session', id: sid, project: proj.name,
       cwd: header?.cwd ?? null, preset: header?.preset ?? null,
@@ -189,5 +206,5 @@ for (const proj of projects) {
 writeFileSync(outPath, out.join('\n') + '\n', 'utf8');
 if (incremental) writeFileSync(cachePath, JSON.stringify(nextCache), 'utf8');
 
-console.error(`[dump] 会话 ${nSessions} 个｜消息 ${nMsgs} 条｜跳过 ${nSkipped}｜失败 ${nFail}`);
+console.error(`[dump] 会话 ${nSessions} 个｜消息 ${nMsgs} 条｜跳过 ${nSkipped}｜失败 ${nFail}｜排除 ${nExcluded}`);
 console.error(`[dump] 输出 ${outPath}（${out.length} 行）`);

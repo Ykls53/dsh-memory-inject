@@ -23,16 +23,47 @@ function makeCtx() {
   }
 }
 
-/** 跑一次 pre-step，返回框架拿到的 decision。 */
-async function runPreStep(config, messages = [], event = {}) {
+/** 跑一次 pre-step，返回框架拿到的 decision。sessionId 用于模拟同一会话的多轮。 */
+async function runPreStep(config, messages = [], event = {}, sessionId = 'sess-test') {
   const ctx = makeCtx()
   apply(ctx, config)
+  // 模拟 system-prompt/assemble：把 sessionId / preset 记下来（pre-step 靠它做会话级指纹缓存）
+  const assemble = ctx.handlers.get('system-prompt/assemble')
+  if (assemble) {
+    await assemble(
+      {},
+      { agent: { session: { header: { id: sessionId, agentPreset: 'test' } } } },
+      async () => ({}),
+    )
+  }
   const handler = ctx.handlers.get('agent/pre-step')
   assert.ok(handler, '插件应当注册 agent/pre-step')
   return handler(
     { step: 1, turn: 1, signal: { aborted: false }, ...event },
     async () => ({ kind: 'enter', messages }),
   )
+}
+
+/** 同一个插件实例（共享会话缓存）跑多轮 pre-step。 */
+function makeRunner(config) {
+  const ctx = makeCtx()
+  apply(ctx, config)
+  return async (messages = [], event = {}, sessionId = 'sess-test') => {
+    const assemble = ctx.handlers.get('system-prompt/assemble')
+    if (assemble) {
+      await assemble(
+        {},
+        { agent: { session: { header: { id: sessionId, agentPreset: 'test' } } } },
+        async () => ({}),
+      )
+    }
+    const handler = ctx.handlers.get('agent/pre-step')
+    assert.ok(handler, '插件应当注册 agent/pre-step')
+    return handler(
+      { step: 1, turn: 1, signal: { aborted: false }, ...event },
+      async () => ({ kind: 'enter', messages }),
+    )
+  }
 }
 
 /** 临时记忆目录 + 两份文件。 */
@@ -63,16 +94,97 @@ test('正常注入：把 USER.md 和 MEMORY.md 拼成一条消息', async () => 
   }
 })
 
-test('去重：历史里已有注入标记就不再注入', async () => {
+test('会话缓存：同会话指纹不变，不重复注入', async () => {
   const dir = withMemoryDir({ 'USER.md': '一条画像' })
   try {
-    const existing = {
-      role: 'user',
-      content: [{ type: 'text', text: '旧注入' }],
-      source: { kind: SOURCE_KIND, form: 'snapshot', sections: [] },
-    }
-    const decision = await runPreStep({ memoryDir: dir }, [existing])
-    assert.strictEqual(decision.messages.length, 1, '不应重复追加')
+    const run = makeRunner({ memoryDir: dir })
+    const first = await run([{ role: 'user', content: [] }])
+    assert.strictEqual(first.messages.length, 2, '首次注入')
+    const second = await run([{ role: 'user', content: [] }])
+    assert.strictEqual(second.messages.length, 1, '同会话指纹没变，不重复注入')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('会话缓存：指纹变了就注入新基线（最新内容在场）', async () => {
+  const dir = withMemoryDir({ 'USER.md': '旧内容' })
+  try {
+    const run = makeRunner({ memoryDir: dir })
+    await run([{ role: 'user', content: [] }])
+    writeFileSync(path.join(dir, 'USER.md'), '新内容', 'utf-8')
+    const second = await run([{ role: 'user', content: [] }])
+    assert.strictEqual(second.messages.length, 2, '指纹变了，追加新基线')
+    assert.match(second.messages[1].content[0].text, /新内容/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('会话缓存：不同会话会重新注入', async () => {
+  const dir = withMemoryDir({ 'USER.md': '一条画像' })
+  try {
+    const run = makeRunner({ memoryDir: dir })
+    await run([{ role: 'user', content: [] }], {}, 'sess-a')
+    const second = await run([{ role: 'user', content: [] }], {}, 'sess-b')
+    assert.strictEqual(second.messages.length, 2, '新会话首次注入')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/** 造一个带会话历史的 mock agent：events 是 [{ type, data }]。 */
+function agentWith(events) {
+  return {
+    session: {
+      surface: { nodes: events.map((_, i) => i) },
+      eventAt: (seq) => events[seq],
+    },
+  }
+}
+
+/** 历史里放一条本插件注入的 user/message。 */
+function injectedEvent(source) {
+  return [{ type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: '记忆' }], source } }]
+}
+
+test('会话历史：历史里有同指纹就不注入（不重复堆）', async () => {
+  const dir = withMemoryDir({ 'USER.md': '一条画像' })
+  try {
+    const ctx = makeCtx()
+    apply(ctx, { memoryDir: dir })
+    const handler = ctx.handlers.get('agent/pre-step')
+    const first = await handler(
+      { step: 1, turn: 1, signal: { aborted: false }, agent: agentWith([]) },
+      async () => ({ kind: 'enter', messages: [{ role: 'user', content: [] }] }),
+    )
+    const injected = first.messages[1]
+    assert.ok(injected.source.baselineIdentity, '应带指纹')
+    const second = await handler(
+      { step: 1, turn: 1, signal: { aborted: false }, agent: agentWith(injectedEvent(injected.source)) },
+      async () => ({ kind: 'enter', messages: [{ role: 'user', content: [] }] }),
+    )
+    assert.strictEqual(second.messages.length, 1, '历史里有同指纹，不该重复注入')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('会话历史：历史被压缩掉（空）就补注入', async () => {
+  const dir = withMemoryDir({ 'USER.md': '一条画像' })
+  try {
+    const ctx = makeCtx()
+    apply(ctx, { memoryDir: dir })
+    const handler = ctx.handlers.get('agent/pre-step')
+    await handler(
+      { step: 1, turn: 1, signal: { aborted: false }, agent: agentWith([]) },
+      async () => ({ kind: 'enter', messages: [{ role: 'user', content: [] }] }),
+    )
+    const second = await handler(
+      { step: 1, turn: 1, signal: { aborted: false }, agent: agentWith([]) },
+      async () => ({ kind: 'enter', messages: [{ role: 'user', content: [] }] }),
+    )
+    assert.strictEqual(second.messages.length, 2, '历史被压缩掉，补注入')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
