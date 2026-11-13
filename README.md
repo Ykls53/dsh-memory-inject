@@ -1,14 +1,15 @@
 # dsh-memory-inject
 
-**给 DeepSeek Harness 加一套「记得住」的记忆：四层，一处也不用你操心。**
+**给 DeepSeek Harness 加一套「记得住」的记忆：三层常驻 + 一张记忆地图，一处也不用你操心。**
 
 大多数 agent 记忆插件只做检索：把对话存成流水账，下次靠语义搜索捞回来。
-这套东西做的是三件事叠在一起 —— 短的常驻、中的会攒、长的能翻。
+这套东西不一样 —— 短的常驻、中的会攒、长的能翻，外加一层按主题归拢的地图。
 
-> Three-layer memory for DeepSeek Harness: always-on curated facts (`USER.md` /
-> `MEMORY.md`), per-session summaries, and full-text recall over every past
-> session. Injection costs zero model calls; the auto-capture layer uses
-> whatever model you've already picked in the UI.
+> Layered memory for DeepSeek Harness: always-on curated facts (`USER.md` /
+> `MEMORY.md`), per-session summaries, full-text recall over every past
+> session, and a wiki memory map maintained offline. Injection costs zero
+> model calls; the auto-capture layer uses whatever model you've already
+> picked in the UI.
 
 ---
 
@@ -20,7 +21,7 @@
 第 2 层  会话摘要   每段对话 2~3 句，进 index.db      问「上周三聊了啥」先看这里
                    ↓ 命中的那条会话可以下钻
 第 3 层  全量原文   所有会话正文 + FTS5 trigram 索引   真正想翻细节时用
-                   
+
 侧  面  记忆地图   wiki/<主题>.md                    按主题归拢的要点页（做梦维护）
                    ↑ 注入里只带一行主题索引，正文靠 memory_wiki 取
 ```
@@ -35,23 +36,24 @@
 **为什么短的必须有硬上限**：第 1 层每个会话都要整份进上下文。它一旦膨胀，
 每个会话都在为「上次写的一堆废话」付 token。所以超预算直接拒绝写入，不截断、不偷偷丢。
 
-**为什么 wiki 不进注入区**：Anthropic 那篇文章讲得很清楚——注入的错笔记会污染每一个会话，
-而且指令越长模型越不照做。所以 wiki 正文留在磁盘上，注入里只放一行主题名当「地图入口」，
-模型真需要细节时才用 `memory_wiki` 取整页。实测该做法下注入只有 283 字符。
+**为什么 wiki 不让它进注入区**：注入区的内容每个会话都要整份进上下文，塞进去有两笔账——
+一是 token 每轮都在付；二是一旦某条记错了，会被带进之后**每一个**会话，而且指令越长模型越不照做。
+所以 wiki 正文留在磁盘上（`<memoryDir>/wiki/<主题>.md`），注入区只放一行主题名当「地图入口」，
+模型真需要细节时才用 `memory_wiki` 取整页。细节见下面「记忆地图」那一节。
 
 具体多少钱，见下面[「这套东西的开销」](#这套东西的开销粗算)那张表。
 
 ## 记忆地图（表征层 wiki）
 
-对齐 Anthropic《The components of agent memory》里「dreaming 构建表征」那一节。
-文章实测：**纯搜索 53%，搜索 + wiki 61%**，而且每题省约 2 万 token——因为 wiki 是地图，
-模型顺着主题走比盲搜快。
+光有条目清单和全文搜索，会缺一层「按主题看全景」的东西：想了解某个项目的整体情况，
+要么逐条翻记忆，要么在搜索里一页页捞。wiki 补的就是这一层。
 
 **它是什么**：`<memoryDir>/wiki/<主题>.md`，一个主题一页，由做梦时自动归拢生成。
 比如「PS5 开发」一页汇总文件传输风险、编译坑；「记忆插件」一页汇总架构决策。
 
-**为什么不在注入区里**：文章明确警告两件事——注入的错笔记会污染每一个会话；
-指令越长模型越不照做。所以：
+**为什么不在注入区里**：注入区的内容每个会话都要整份进上下文，塞进去有两笔账——
+一是一页页 wiki 的 token 每轮都在付；二是一旦某页记错了，会被带进之后**每一个**会话。
+所以：
 
 | | 处理方式 |
 |---|---|
@@ -60,35 +62,30 @@
 | 搜索 | `memory_search` 命中时附带 `relatedWiki`，等于「链接」 |
 
 **怎么让它长**：跑「做梦整理」。模型会把相关条目归拢成主题页，主题页里可以写
-`相关：另一个主题名` 做链接。文章有个反面教训——wiki 做得太细会「比原文还大」，
-那等于没抽象，所以 prompt 里限制一个主题 15 行内。
+`相关：另一个主题名` 做链接。注意别做太细——一页塞满细节等于没抽象，
+所以 prompt 里限制一个主题 15 行内。
 
 **面板**：「记忆地图」页签能看有哪些主题、点开看整页。
 
 ## 访问频率调优
 
-对齐文章那句「持续核查全部记忆不现实，应该把做梦集中在容易变的信息上，
-或者**按记忆被访问的频率来调做梦节奏**」。
+做梦的算力有限，不可能每次都把全部记忆核对一遍。所以按「用得多的优先」来排：
 
 - 每注入一次，给那一批条目记一次 `n`（次数）和 `at`（最近时间）
 - 做梦时按 **`log2(1+n) × 2 + 距上次核对天数 / 10`** 排序，分高的排前面
 - 核对完（哪怕结论是「无变化」）标 `checked`，下次排后面
 - 统计存在 `<memoryDir>/.usage.json`，**不进记忆正文、不占注入预算**，超 500 条自动裁
 
-效果实测：高频 + 久未核对的条目排第一，刚核对过的沉底。这样每轮做梦的算力
+效果：高频 + 久未核对的条目排第一，刚核对过的沉底。这样每轮做梦的算力
 优先花在真在用的记忆上，而不是每次都把全部条目过一遍。
 
 ## 细节下沉
 
-对齐文章那句「顶层必须保持相对小， dreaming 的很大一部分工作就是保持它小
-——**把一些细节移到层级下方，只留下链接**」。
-
-以前是「预算满了就顶掉最差的条目」= **直接丢**。现在改成两步：
+注入区放不下时，以前是「顶掉最差的条目」= **直接丢**。现在改成两步，内容不留失：
 
 1. 先把要腾位置的条目**挪进归档页** `wiki/归档.md`
 2. 挪成功才从记忆里移除（挪不动才真顶掉，且会在返回里说明）
 
-效果（实测）：`记忆 6→5 条，归档页 122 字符`——预算腾出来了，内容一个字没丢。
 归档页会自动出现在 WIKI 索引里，模型随时能用 `memory_wiki('归档')` 翻到。
 面板 `/archive` 能看到归档了什么，`/lift` 能把某条取回记忆。
 
@@ -120,8 +117,8 @@
 
 ## 做梦通道（跨会话离线整理）
 
-对齐 Anthropic《The components of agent memory》里的 **dreaming**：提炼负责从新会话里
-**采集**新事实，做梦负责拿历史转录当依据，**核对 / 纠正 / 合并 / 删改**已有的第 1 层记忆。
+提炼只在「一轮刚结束」时干活，看到的是那一轮的局部。做梦补的就是另一半：
+拿历史转录当依据，回头**核对 / 纠正 / 合并 / 删改**已有的第 1 层记忆。
 
 ```
 提炼回填  一轮结束 → 从「这一轮」挑新事实写回     （采集）
@@ -159,27 +156,40 @@
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `dreamModelProvider` | `''` | `'opencode-go'`（HTTP 直调）/ `'headless'`（走 headless 会话）/ 留空（先 HTTP 再回退 headless） |
+| `dreamModelProvider` | `''` | 填宿主 provider 名（如 `OpenCode Go`）→ 走 llm 服务；填 `headless` → 强制 headless；留空 → 跟提炼通道 |
 | `dreamModelName` | `''` | 留空 = 跟提炼通道同一个模型（`extractModel`）；填了就覆盖 |
 
-provider 填不认的值会被忽略并跟随提炼通道，日志里会标注（跟刷B站插件的 ignored 标注一致）。
+填的 provider 在宿主里真没有驱动的话，那一轮会失败并在日志里写明原因（不会悄悄换别的模型跑）。
 
 > 注：与提炼回填不同，做梦**不采集新事实**，只整理已有记忆。两者各司其职，别混。
 
 ## 设置面板
 
-装完在「设置」左侧多一项 **记忆**（排在「刷B站」后面），两个页签。
+装完在「设置」左侧多一项 **记忆**（排在「刷B站」后面），三个页签。
 
 **常驻记忆（第 1 层）**
+
+顶部是工具条，一行搞定：`自动总结 · 开` ｜ `提炼一轮` ｜ `做梦整理` ｜ `模型 ⚙`。
+下面一行显示当前用的是哪个模型，「提炼一轮」会抓哪个目录。
 
 | 功能 | 说明 |
 |---|---|
 | 自动总结开关 | 开了立刻生效，不用重启 |
-| 现在提炼最近一轮 | 不等自动，手动跑一次；结果写回并刷新列表 |
+| 提炼一轮 | 不等自动，手动提炼最近一轮；结果写回并刷新列表 |
+| 做梦整理 | 拿历史转录核对已有记忆（只做增量，不会压掉内容） |
+| 模型 ⚙ | 展开是从**当前客户端可用模型**里点选的下拉，不用手打。改完点保存立刻生效 |
 | 条目增删改 | 逐条编辑、删除、添加；**字符上限自己定**（数字框，改完立刻生效） |
+| 锁定条目 | 锁住的条目在预算满时不会被顶掉/下沉 |
 | 相似检测 | 加之前先跟已有条目比双字组重合度，像的就提示「合并还是照加」 |
 | 历史回滚 | 列出 `.backup/` 里最近 10 份，点一下恢复（恢复前会先把当前内容也备一份） |
 | 导出 / 导入 | 导出 JSON 留档或换机器；导入可选「合并（只加没有的）」或「整份覆盖」 |
+
+**记忆地图（表征层 wiki）**
+
+| 功能 | 说明 |
+|---|---|
+| 主题列表 | 列出所有 wiki 主题及一句话摘要 |
+| 点主题展开 | 看该主题整页内容 |
 
 **会话摘要（第 2 / 3 层）**
 
@@ -188,7 +198,7 @@ provider 填不认的值会被忽略并跟随提炼通道，日志里会标注�
 | 会话列表 | 最近 60 个：标题 / 时间 / 消息数 / 摘要 |
 | 搜索 | 走同一套 FTS5，和模型调的 `memory_search` 一个逻辑 |
 | 点标题展开原文 | 下钻第 3 层，直接看该会话完整对话 |
-| 重建索引 | 一个按钮跑 dump + build，不用记命令 |
+| 立即重建 | 手动强制跑 dump + build。平时不用点——每天第一次启动会自动跑（见下面「建索引」） |
 
 面板改的开关和上限存在 `<memoryDir>/.settings.json`，优先级高于 `cordis.patch.yml` ——
 所以面板是「运行时开关」，patch 是「出厂默认」。
@@ -234,10 +244,19 @@ dsh plugin --profile desktop add /path/to/dsh-memory-inject
 
 ```
 ~/.dsh/memories/
-├── USER.md        用户是谁：称呼、脾气、偏好、反感（预算 1375 字符）
-├── MEMORY.md      环境事实：路径、端口、坑、命令（预算 2200 字符）
-├── index.db       第 2/3 层的索引（由脚本生成）
-└── .backup/       每次写入前的自动备份
+├── USER.md          用户是谁：称呼、脾气、偏好、反感（预算 1375 字符）
+├── MEMORY.md        环境事实：路径、端口、坑、命令（预算 2200 字符）
+├── wiki/            记忆地图：一个主题一个 .md，做梦时维护
+│   └── 归档.md      预算满时下沉下来的细节（内容不丢）
+├── index.db         第 2/3 层的索引（脚本生成，或每天自动重建）
+├── dump.jsonl       会话转录导出的中间产物（建索引用）
+├── .backup/         每次写入前的自动备份
+├── .usage.json      访问统计（注入次数/最近核对时间），不占注入预算
+├── .rejected.json   墓碑：删过的条目，防止被写回来
+├── .evicted.json    顶位记录：腾过哪些、为什么
+├── .settings.json   面板改的开关与上限
+├── .last-reindex    上次重建索引的时间
+└── .load.log        装载探针（排查「插件没生效」用）
 ```
 
 格式是硬性的：**一行一条，条目之间单独一行 `§`**，不要标题、不要段落。
@@ -294,10 +313,17 @@ python scripts/dsh-memory-index.py search "关键词"      # 验证一下
 | `onlyPresets` | `[]` | 只在这些 preset 上注入；空 = 不限。配了就优先于 `skipPresets` |
 | `autoCapture` | `false` | 全自动回填开关 |
 | `captureTimeoutMs` | 180000 | 提炼子进程超时 |
-| `extractProvider` | `''` | 提炼走哪条 provider 路由；和 `extractModel` 一起填则走宿主 llm 服务 |
-| `dreamModelProvider` | `''` | 做梦通道走哪条通道：`opencode-go` / `headless` / 留空（先 HTTP 再回退） |
-| `dreamModelName` | `''` | 做梦用的模型；留空 = 跟提炼通道同一个模型 |
+| `skipCaptureCwds` | `['\\qqbot', 'bili-duty', '.dsh\\memories']` | 这些工作目录的会话**不参与提炼**（机器语境，不是你自己的对话） |
+| `extractBaseURL` | OpenCode Go 端点 | HTTP 直调通道的地址 |
+| `extractApiKeyEnv` | `OPENCODE_API_KEY` | 从 `~/.dsh/.env` 读哪个键当凭据 |
+| `extractHttpTimeoutMs` | 90000 | HTTP 提炼超时 |
+| `extractProvider` | `''` | 提炼走哪条 provider 路由；和 `extractModel` 一起填则走**宿主 llm 服务**（推荐） |
+| `extractModel` | `deepseek-v4.1-flash` | 提炼用的模型名 |
+| `dreamModelProvider` | `''` | 做梦走哪条路：填宿主 provider 名 → 走 llm 服务；`headless` → 强制 headless；留空 → 跟提炼通道 |
+| `dreamModelName` | `''` | 做梦用的模型；留空 = 跟 `extractModel` 同一个 |
 | `dreamSnippetChars` | 6000 | 喂给做梦的转录片段总预算（字符） |
+| `wikiIndex` | `true` | 注入里是否带那行主题索引 |
+| `wikiIndexChars` | 600 | 主题索引的字符预算 |
 | `autoReindex` | `true` | 每天第一次启动自动重建索引 |
 | `autoReindexHours` | 24 | 两次自动重建的最小间隔（小时） |
 
@@ -447,13 +473,21 @@ DSH 桌面端每次启动都会给 `127.0.0.1` 写一条登录 cookie，名字�
 npm test
 ```
 
-**68 个用例，全部离线**（不需要装进 DSH）：
+**110 个用例，全部离线**（不需要装进 DSH）：
 
-- `test/inject.test.js`（15）— 注入、会话缓存（同会话指纹不变不注入 / 指纹变了注入 / 不同会话重注入）、会话历史（同指纹不注入 / 压缩后补注入）、空目录、目录不存在、预算守门、step 过滤、turn 白名单、拒绝分支
-- `test/store.test.js`（9）— 条目往返、预算拒绝、原子批量、remove 未命中整批失败、patch 唯一性、写前备份、重复不加
-- `test/api.test.js`（16）— 面板每个端点真调一遍：state / write / config / backups / restore（含路径穿越拦截）/ similar / export / import / sessions / search / session / capture / 404
-- `test/guard.test.js` — 提炼守卫（墓碑、相似度、黑名单）
-- `test/dream.test.js`（6）— 做梦通道的 parseDream 解析
+| 文件 | 数量 | 测什么 |
+|---|---|---|
+| `inject.test.js` | 15 | 注入、会话缓存（同会话指纹不变不注入 / 变了才注入 / 不同会话重注入）、会话历史（同指纹不注入 / 压缩后补注入）、空目录、目录不存在、预算守门、step 过滤、turn 白名单、拒绝分支 |
+| `store.test.js` | 9 | 条目往返、预算拒绝、原子批量、remove 未命中整批失败、patch 唯一性、写前备份、重复不加 |
+| `api.test.js` | 20 | 面板每个端点真调一遍：state / write / config / backups / restore（含路径穿越拦截）/ similar / export / import / sessions / search / session / capture / 404 |
+| `guard.test.js` | 18 | 提炼守卫：墓碑、相似度、cwd/preset 黑名单、锁定与腾位 |
+| `dream.test.js` | 10 | 做梦操作解析（`parseDreamOps`）：FIX/DROP/ADD、装饰容忍、编号归属、越界丢弃 |
+| `dream-guard.test.js` | 7 | 做梦只做增量：NONE 不动、FIX 只改点名条、DROP 其余保留、9 条改 1 条仍 9 条、删太狠被拦 |
+| `draft.test.js` | 8 | 草稿拦截：自问自答、整句英文、残句、代码实现说明、任务进展；不误伤真事实 |
+| `wiki.test.js` | 9 | 表征层：主题页解析、**正文不整篇注入**、做梦能建页、与记忆操作并存 |
+| `usage.test.js` | 5 | 访问频率：注入计数、**超 40 条写回不丢数据**、checked 标记、文件不膨胀 |
+| `sink.test.js` | 4 | 细节下沉：**原条目要么在记忆里要么在归档里，不能凭空消失** |
+| `auto-reindex.test.js` | 5 | 自动重建判据：从未跑/刚跑过/超 24h/关闭/自定义间隔 |
 
 ## 回退
 
