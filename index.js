@@ -199,6 +199,15 @@ export const DEFAULTS = {
    */
   wikiIndex: true,
   wikiIndexChars: 600,
+  /**
+   * 自动重建索引（2026-11-14 加）：每天第一次启动时自动跑一次 dump + build。
+   * 为什么：重建要扫全部会话转录、耗时几分钟，以前得点按钮；
+   * 但索引过时会让搜索和做梦都拿到旧数据，所以改成「每天第一次启动时后台跑一次」。
+   * 手动按钮保留（随时能强制重建）。
+   */
+  autoReindex: true,
+  /** 两次自动重建的最小间隔（小时）；默认 24 = 每天最多一次。 */
+  autoReindexHours: 24,
 }
 
 const PREAMBLE =
@@ -554,6 +563,7 @@ export function apply(ctx, config = {}) {
   whenReady(['tools'], 'memory_wiki 工具', (c) => registerWikiTool(c, cfg))
   whenReady(['tools'], 'memory_remember 工具', (c) => registerWriteTool(c, cfg))
   guard('自动回填', () => applyAutoCapture(ctx, cfg))
+  guard('自动重建索引', () => scheduleAutoReindex(ctx, cfg))
   whenReady(['webServer'], '面板接口', (c) => registerHttp(c, cfg))
 
   _probe('apply 完成，全部功能注册走完')
@@ -2825,6 +2835,10 @@ function statePayload(cfg) {
     extractModel: String(cfg.extractModel || ''),
     // 细节下沉的现状：归档页里存了多少条（预算紧张时从常驻记忆挪过去的）
     archiveCount: archiveCount(cfg.memoryDir),
+    // 自动重建索引的现状（面板显示「每天首次启动自动跑」）
+    autoReindex: cfg.autoReindex !== false,
+    autoReindexHours: Number(cfg.autoReindexHours) || 24,
+    lastReindexAt: readLastReindex(cfg.memoryDir),
     dreamModelProvider: String(cfg.dreamModelProvider || ''),
     dreamModelName: String(cfg.dreamModelName || ''),
     dreamNote: '做梦通道：跨会话离线整理已有记忆。留空 = 跟提炼通道同一个模型',
@@ -3015,6 +3029,71 @@ function importAll(cfg, data, mode = 'merge') {
   return { ok: true, report }
 }
 
+/** 上次自动重建索引的时间（毫秒时间戳；0 = 从未）。 */
+function readLastReindex(dir) {
+  try {
+    const p = path.join(dir, '.last-reindex')
+    if (!existsSync(p)) return 0
+    return Number(readFileSync(p, 'utf-8').trim()) || 0
+  } catch {
+    return 0
+  }
+}
+
+/**
+ * 自动重建索引（2026-11-14 加）。
+ *
+ * 为什么：重建要扫全部会话转录、几分钟，以前必须手动点按钮；
+ * 但索引过时会让搜索和做梦拿到旧数据。改成每天第一次启动时后台跑一次。
+ *
+ * 判据用 <memoryDir>/.last-reindex（不用 cron）：启动时看距上次多久，
+ * 超过 autoReindexHours（默认 24h）就跑。这样「每天第一次启动」自然成立，
+ * 同一天里反复重开客户端不会重复扫。
+ */
+function scheduleAutoReindex(ctx, cfg) {
+  if (cfg.autoReindex === false) {
+    _probe('自动重建索引：已关闭（autoReindex: false）')
+    return
+  }
+  const hours = Number(cfg.autoReindexHours) || 24
+  const stampFile = path.join(cfg.memoryDir, '.last-reindex')
+  let last = 0
+  try {
+    if (existsSync(stampFile)) last = Number(readFileSync(stampFile, 'utf-8').trim()) || 0
+  } catch {
+    last = 0
+  }
+  const elapsedH = (Date.now() - last) / 3600000
+  if (last && elapsedH < hours) {
+    _probe(`自动重建索引：距上次 ${elapsedH.toFixed(1)} 小时，不到 ${hours} 小时，跳过`)
+    return
+  }
+  // 后台跑，不阻塞插件装载和应用启动
+  _probe(`自动重建索引：距上次 ${last ? elapsedH.toFixed(1) + ' 小时' : '从未'}，开始（后台）`)
+  setTimeout(() => {
+    try {
+      reindex(cfg)
+        .then((r) => {
+          try {
+            writeFileSync(stampFile, String(Date.now()), 'utf-8')
+          } catch {
+            /* 时间戳写不了不影响索引本身 */
+          }
+          const tail = String(r?.log || '').split('\n').filter(Boolean).slice(-2).join('；')
+          _probe(`自动重建索引完成：${tail || '(无输出)'}`)
+          ctx.logger?.info?.(`[${PLUGIN_NAME}] 自动重建索引完成：${tail || ''}`)
+        })
+        .catch((e) => _probe(`自动重建索引失败：${e?.message || e}`))
+    } catch (e) {
+      _probe(`自动重建索引启动失败：${e?.message || e}`)
+    }
+  }, 8000) // 等宿主稳下来再跑，别和启动抢资源
+  if (typeof ctx.effect === 'function') {
+    // 宿主卸载时不需要取消：dump/build 是独立子进程，跑完自然结束
+    ctx.effect(() => () => {}, 'memory-inject.autoReindex')
+  }
+}
+
 /** 重建索引：先跑 dump（node，自带），再跑 index（python，有就跑）。 */
 function reindex(cfg) {
   return new Promise((resolve) => {
@@ -3102,6 +3181,10 @@ function listSessions(cfg, limit = 50) {
       ok: true,
       total,
       withSummary,
+      // 自动重建现状：面板据此在搜索栏下面说明「每天首次启动会自动跑」
+      autoReindex: cfg.autoReindex !== false,
+      autoReindexHours: Number(cfg.autoReindexHours) || 24,
+      lastReindexAt: readLastReindex(cfg.memoryDir),
       sessions: rows.map((r) => ({
         id: r.id,
         title: r.title || '(无标题)',

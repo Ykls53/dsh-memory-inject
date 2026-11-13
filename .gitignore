@@ -18,4 +18,5 @@ Thumbs.db
 .rejected.json
 .evicted.json
 .settings.json
+.last-reindex
 

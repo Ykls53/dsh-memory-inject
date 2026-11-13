@@ -255,7 +255,13 @@ dsh plugin --profile desktop add /path/to/dsh-memory-inject
 
 ## 建索引（第 2/3 层）
 
-插件只**查**索引，不建索引。建索引用 `scripts/` 里两个脚本：
+**默认自动跑**：每天第一次启动客户端时，插件在后台自动跑一遍 dump + build
+（距上次满 `autoReindexHours`（默认 24）小时才跑，同一天反复重开不会重复扫）。
+面板「会话摘要」页会显示上次自动跑的时间；想手动强制重跑点「立即重建」。
+
+判据存在 `<memoryDir>/.last-reindex`，不想自动跑就配 `autoReindex: false`。
+
+插件只**查**索引，不建索引。要手动建，用 `scripts/` 里两个脚本：
 
 ```bash
 # 1) 把 DSH 所有会话转录（多帧 zstd）解压成 JSONL
@@ -292,6 +298,8 @@ python scripts/dsh-memory-index.py search "关键词"      # 验证一下
 | `dreamModelProvider` | `''` | 做梦通道走哪条通道：`opencode-go` / `headless` / 留空（先 HTTP 再回退） |
 | `dreamModelName` | `''` | 做梦用的模型；留空 = 跟提炼通道同一个模型 |
 | `dreamSnippetChars` | 6000 | 喂给做梦的转录片段总预算（字符） |
+| `autoReindex` | `true` | 每天第一次启动自动重建索引 |
+| `autoReindexHours` | 24 | 两次自动重建的最小间隔（小时） |
 
 ### 为什么默认排除 qqbot
 

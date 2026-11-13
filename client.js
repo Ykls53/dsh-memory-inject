@@ -399,12 +399,20 @@ window.__ModuleLoader__.load({
             }),
             h('button', { style: btnPrimary, onClick: doSearch }, '搜索'),
             hits ? h('button', { style: btn, onClick: () => { setHits(null); setMsg('') } }, '回到最近') : null,
-            h('button', { style: btn, disabled: busy, onClick: rebuild }, '重建索引'),
+            h('button', { style: btn, disabled: busy, onClick: rebuild, title: '每天第一次启动会自动重建；这个按钮是手动强制重跑' }, '立即重建'),
           ),
           h('div', { style: { ...muted, whiteSpace: 'pre-wrap' } },
             data
               ? `共 ${data.total} 个会话，其中 ${data.withSummary} 个有摘要${msg ? '　·　' + msg : ''}`
               : (msg || '读取中…')),
+          // 自动重建说明：不用再点了，每天第一次启动会自己跑
+          data && data.autoReindex !== false
+            ? h('div', { style: { ...muted, marginTop: 4 } },
+                `索引每天第一次启动时自动重建（每 ${data.autoReindexHours || 24} 小时最多一次）` +
+                (data.lastReindexAt
+                  ? `　·　上次：${new Date(data.lastReindexAt).toLocaleString('zh-CN')}`
+                  : '　·　还没自动跑过'))
+            : null,
         ),
 
         list.length === 0
