@@ -285,12 +285,6 @@ function buildBlock(cfg) {
   return cfg.includePreamble ? `${PREAMBLE}\n\n${body}` : body
 }
 
-/** 历史里是否已经有本插件注入的那条（压缩掉之后会返回 false，于是补注入）。 */
-function alreadyInjected(messages) {
-  if (!Array.isArray(messages)) return false
-  return messages.some((m) => m && m.source && m.source.kind === SOURCE_KIND)
-}
-
 /** 内容指纹：注入文本的 sha1 短哈希。文件改了指纹就变，用于会话级「没变不注入」。 */
 function hashText(text) {
   return createHash('sha1').update(String(text || '')).digest('hex').slice(0, 16)
@@ -1825,7 +1819,11 @@ function runHeadlessExtract(prompt, cfg) {
         cwd: cfg.memoryDir,
         env: { ...process.env, [AUTO_ENV]: '1' },
         stdio: ['pipe', 'pipe', 'pipe'],
-        shell: process.platform === 'win32', // dsh 在 Windows 上是 .cmd
+        // dsh 在 Windows 上是 .cmd 壳，不走 shell 起不来。
+        // Node 24 会因此报一个 DEP0190 警告（"args 未转义"）——这里参数全是我们
+        // 自己写死的字面量（'--profile' / 'headless'），没有外部输入，不构成注入风险，
+        // 警告可以忽略。别为了消警告改成 shell:false，那会让 Windows 上直接起不来。
+        shell: process.platform === 'win32',
         windowsHide: true,
       })
     } catch {
@@ -3111,6 +3109,8 @@ function reindex(cfg) {
             cwd: cfg.memoryDir,
             env: { ...process.env, [AUTO_ENV]: '1' },
             stdio: ['ignore', 'pipe', 'pipe'],
+            // 同 runHeadlessExtract：Windows 上要为 .cmd 走 shell。
+            // DEP0190 警告可忽略（args 是脚本绝对路径，不是外部输入）。
             shell: process.platform === 'win32',
             windowsHide: true,
           })
